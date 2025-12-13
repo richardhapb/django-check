@@ -1,29 +1,30 @@
-use ruff_python_ast::{Expr, ExprName, Stmt, StmtFor};
+use ruff_python_ast::{Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::parse_module;
+use ruff_text_size::Ranged;
 use std::collections::HashMap;
 use std::env::home_dir;
-// use std::env::current_dir;
 use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
 fn main() {
-    // let cwd = current_dir().unwrap();
     let home = home_dir().unwrap();
-    let path = home.join("dev/agora_hedge/main/app");
-    get_for_statements(&path).unwrap();
+    let path = home.join("dev/ddirt/development/app");
+
+    if let Err(e) = analyze_directory(&path) {
+        eprintln!("Error: {}", e);
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum QuerySetState {
     Safe,
     Unsafe,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum BindingKind {
-    QuerySetCandidate(QuerySetState),
-    NoQuerySet,
+    QuerySet(QuerySetState),
     Unknown,
 }
 
@@ -40,345 +41,282 @@ impl ScopeState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct LoopContext {
+    loop_var: String,
+    unsafe_queryset: bool,
+}
+
 #[derive(Debug)]
-struct Context {
+struct Diagnostic {
     filename: String,
-    stack: Vec<ScopeState>,
+    line: usize,
+    col: usize,
+    message: String,
 }
 
-impl Context {
-    fn new(filename: String) -> Self {
-        let mut stack = Vec::new();
-        // Global state
-        stack.push(ScopeState::new());
-        Self { filename, stack }
-    }
-    fn current_scope(&self) -> Option<&ScopeState> {
-        self.stack.iter().last()
-    }
-
-    fn current_scope_mut(&mut self) -> Option<&mut ScopeState> {
-        self.stack.iter_mut().last()
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}: {}",
+            self.filename, self.line, self.col, self.message
+        )
     }
 }
 
-fn is_candidate(name: &str, ctx: &Context) -> bool {
-    if let Some(scope) = ctx.current_scope() {
-        scope
-            .symbols
-            .iter()
-            .filter_map(|(n, k)| {
-                match k {
-                    BindingKind::QuerySetCandidate(state)
-                        if matches!(state, QuerySetState::Unsafe) =>
-                    {
-                        true
-                    }
-                    _ => false,
+struct Analyzer<'a> {
+    filename: String,
+    source: &'a str,
+    scopes: Vec<ScopeState>,
+    active_loops: Vec<LoopContext>,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl<'a> Analyzer<'a> {
+    fn new(filename: String, source: &'a str) -> Self {
+        Self {
+            filename,
+            source,
+            scopes: vec![ScopeState::new()],
+            active_loops: Vec::new(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn current_scope_mut(&mut self) -> &mut ScopeState {
+        self.scopes
+            .last_mut()
+            .expect("scope stack should never be empty")
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(ScopeState::new());
+    }
+
+    fn pop_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    /// Look up a binding across all scopes (innermost first)
+    fn lookup(&self, name: &str) -> Option<&BindingKind> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(kind) = scope.symbols.get(name) {
+                return Some(kind);
+            }
+        }
+        None
+    }
+
+    /// Check if a name refers to an unsafe queryset
+    fn is_unsafe_queryset(&self, name: &str) -> bool {
+        matches!(
+            self.lookup(name),
+            Some(BindingKind::QuerySet(QuerySetState::Unsafe))
+        )
+    }
+
+    /// Classify an expression to determine if it produces a queryset and its safety
+    fn classify_expr(&self, expr: &Expr) -> BindingKind {
+        self.classify_expr_inner(expr, &mut Vec::new())
+    }
+
+    fn classify_expr_inner(&self, expr: &Expr, chain: &mut Vec<String>) -> BindingKind {
+        match expr {
+            Expr::Call(call) => {
+                // Track method name if it's an attribute call
+                if let Expr::Attribute(attr) = call.func.as_ref() {
+                    chain.push(attr.attr.id.to_string());
                 }
-                .then_some(n.as_str())
-            })
-            .collect::<Vec<&str>>()
-            .contains(&name)
-    } else {
-        false
+                self.classify_expr_inner(&call.func, chain)
+            }
+            Expr::Attribute(attr) => {
+                if attr.attr.id.as_str() == "objects" {
+                    // Found .objects - this is a queryset origin
+                    // Check if any method in the chain makes it safe
+                    let safe_methods = [
+                        "select_related",
+                        "prefetch_related",
+                        "only",
+                        "defer",
+                        "values",
+                        "values_list",
+                        "iterator",
+                    ];
+
+                    let is_safe = chain.iter().any(|m| safe_methods.contains(&m.as_str()));
+                    let state = if is_safe {
+                        QuerySetState::Safe
+                    } else {
+                        QuerySetState::Unsafe
+                    };
+                    BindingKind::QuerySet(state)
+                } else {
+                    self.classify_expr_inner(&attr.value, chain)
+                }
+            }
+            Expr::Name(name) => {
+                // Propagate binding kind if we're chaining off a known queryset
+                if let Some(kind) = self.lookup(name.id.as_str()) {
+                    kind.clone()
+                } else {
+                    BindingKind::Unknown
+                }
+            }
+            _ => BindingKind::Unknown,
+        }
+    }
+
+    /// Record an assignment in the current scope
+    fn record_assignment(&mut self, target: &Expr, value: &Expr) {
+        if let Expr::Name(name) = target {
+            let kind = self.classify_expr(value);
+            self.current_scope_mut()
+                .symbols
+                .insert(name.id.to_string(), kind);
+        }
+    }
+
+    /// Emit an N+1 diagnostic
+    fn make_n1_diagnostic(&self, expr: &Expr, loop_var: &str, attr_name: &str) -> Diagnostic {
+        let range = expr.range();
+        let line = self.source[..range.start().to_usize()]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count()
+            + 1;
+        let col = range.start().to_usize()
+            - self.source[..range.start().to_usize()]
+                .rfind('\n')
+                .map(|p| p + 1)
+                .unwrap_or(0)
+            + 1;
+
+        Diagnostic {
+            filename: self.filename.clone(),
+            line,
+            col,
+            message: format!(
+                "Potential N+1 query: accessing `{}.{}` inside loop over unoptimized queryset",
+                loop_var, attr_name
+            ),
+        }
     }
 }
 
-fn evaluate_for(for_stmt: &StmtFor, ctx: &mut Context) {
-    if let Expr::Name(name) = for_stmt.iter.as_ref()
-        && is_candidate(&name.id.as_str(), ctx)
-    {
-        for expr in for_stmt.body.iter() {
-            if find_n1(&expr, &for_stmt.target, ctx)
-                && let Expr::Name(name) = for_stmt.target.as_ref()
-            {
-                println!(
-                    "[{}] {} is a N + 1 candidate!",
-                    ctx.filename,
-                    name.id.as_str()
-                );
+impl<'a> Visitor<'a> for Analyzer<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            // Track assignments
+            Stmt::Assign(assign) => {
+                for target in &assign.targets {
+                    self.record_assignment(target, &assign.value);
+                }
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(ref value) = assign.value {
+                    self.record_assignment(&assign.target, value);
+                }
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
+            }
+
+            // Handle for loops - push loop context before traversing body
+            Stmt::For(for_stmt) => {
+                let mut pushed_loop = false;
+
+                // Check if iterating over an unsafe queryset
+                if let Expr::Name(iter_name) = for_stmt.iter.as_ref() {
+                    if self.is_unsafe_queryset(iter_name.id.as_str()) {
+                        if let Expr::Name(target) = for_stmt.target.as_ref() {
+                            self.active_loops.push(LoopContext {
+                                loop_var: target.id.to_string(),
+                                unsafe_queryset: true,
+                            });
+                            pushed_loop = true;
+                        }
+                    }
+                }
+
+                // Traverse the loop body with context active
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
+
+                if pushed_loop {
+                    self.active_loops.pop();
+                }
+            }
+
+            // Handle scope-creating statements
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
+                self.push_scope();
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
+                self.pop_scope();
+            }
+
+            // Default: just walk
+            _ => {
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
             }
         }
     }
-}
 
-fn walk_expression<'a>(
-    expr: &'a Expr,
-    loop_name: &ExprName,
-    traceback: &mut Vec<&'a Expr>,
-) -> bool {
-    traceback.push(expr);
-    match expr {
-        Expr::Lambda(expr_lambda) => walk_expression(&expr_lambda.body, loop_name, traceback),
-        Expr::If(expr_if) => {
-            walk_expression(&expr_if.body, loop_name, traceback)
-                || walk_expression(&expr_if.orelse, loop_name, traceback)
-                || walk_expression(&expr_if.test, loop_name, traceback)
-        }
-        Expr::Dict(expr_dict) => expr_dict
-            .iter_values()
-            .any(|v| walk_expression(v, loop_name, traceback)),
-        Expr::ListComp(expr_list_comp) => expr_list_comp
-            .generators
-            .iter()
-            .any(|g| walk_expression(&g.target, loop_name, traceback)),
-        Expr::SetComp(expr_set_comp) => expr_set_comp
-            .generators
-            .iter()
-            .any(|g| walk_expression(&g.target, loop_name, traceback)),
-        Expr::DictComp(expr_dict_comp) => expr_dict_comp
-            .generators
-            .iter()
-            .any(|g| walk_expression(&g.target, loop_name, traceback)),
-        Expr::Generator(expr_generator) => expr_generator
-            .generators
-            .iter()
-            .any(|g| walk_expression(&g.target, loop_name, traceback)),
-        Expr::Call(expr_call) => expr_call
-            .arguments
-            .args
-            .iter()
-            .any(|a| walk_expression(a, loop_name, traceback)),
-        Expr::Attribute(attr) => walk_expression(&attr.value, loop_name, traceback),
-        Expr::Name(expr_name) => {
-            expr_name.id.as_str() == loop_name.id.as_str()
-                && traceback.iter().any(|t| matches!(t, Expr::Attribute(_)))
-        }
-        Expr::List(expr_list) => expr_list
-            .elts
-            .iter()
-            .any(|e| walk_expression(e, loop_name, traceback)),
-        Expr::Tuple(expr_tuple) => expr_tuple
-            .elts
-            .iter()
-            .any(|e| walk_expression(e, loop_name, traceback)),
-        _ => false,
-    }
-}
-
-fn walk_expressions(stmt: &Stmt, loop_name: &ExprName) -> bool {
-    match stmt {
-        Stmt::Return(stmt_return) => {
-            let Some(ref expr) = stmt_return.value else {
-                return false;
-            };
-            walk_expression(&expr, loop_name, &mut Vec::new())
-        }
-        Stmt::Assign(stmt_assign) => {
-            walk_expression(&stmt_assign.value, loop_name, &mut Vec::new())
-        }
-        Stmt::AnnAssign(stmt_ann_assign) => stmt_ann_assign
-            .value
-            .as_ref()
-            .and_then(|value| Some(walk_expression(&value, loop_name, &mut Vec::new())))
-            .unwrap_or(false),
-        Stmt::For(stmt_for) => walk_expression(&stmt_for.iter, loop_name, &mut Vec::new()),
-        Stmt::While(stmt_while) => stmt_while
-            .body
-            .iter()
-            .any(|v| walk_expressions(v, loop_name)),
-        Stmt::If(stmt_if) => {
-            walk_expression(&stmt_if.test, loop_name, &mut Vec::new())
-                || stmt_if.body.iter().any(|e| walk_expressions(e, loop_name))
-                || stmt_if.elif_else_clauses.iter().any(|e| {
-                    e.test
-                        .as_ref()
-                        .and_then(|t| Some(walk_expression(&t, loop_name, &mut Vec::new())))
-                        .unwrap_or(false)
-                        || e.body.iter().any(|e| walk_expressions(e, loop_name))
-                })
-        }
-        Stmt::Match(stmt_match) => {
-            walk_expression(&stmt_match.subject, loop_name, &mut Vec::new())
-                || stmt_match
-                    .cases
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Attribute(attr) = expr {
+            if let Expr::Name(name) = attr.value.as_ref() {
+                let new_diags: Vec<_> = self
+                    .active_loops
                     .iter()
-                    .any(|c| c.body.iter().any(|b| walk_expressions(b, loop_name)))
-        }
-        Stmt::Try(stmt_try) => {
-            stmt_try.handlers.iter().any(|h| {
-                h.as_except_handler()
-                    .and_then(|h| Some(h.body.iter().any(|e| walk_expressions(e, loop_name))))
-                    .unwrap_or(false)
-            }) || stmt_try
-                .orelse
-                .iter()
-                .any(|h| walk_expressions(h, loop_name))
-                || stmt_try.body.iter().any(|e| walk_expressions(e, loop_name))
-                || stmt_try
-                    .finalbody
-                    .iter()
-                    .any(|e| walk_expressions(e, loop_name))
-        }
-        Stmt::Assert(stmt_assert) => walk_expression(&stmt_assert.test, loop_name, &mut Vec::new()),
-        Stmt::Expr(stmt_expr) => walk_expression(&stmt_expr.value, loop_name, &mut Vec::new()),
-        _ => false,
-    }
-}
+                    .filter(|ctx| ctx.unsafe_queryset && name.id.as_str() == ctx.loop_var)
+                    .map(|ctx| self.make_n1_diagnostic(expr, &ctx.loop_var, attr.attr.id.as_str()))
+                    .collect();
 
-fn find_n1(stmt: &Stmt, loop_var: &Expr, ctx: &Context) -> bool {
-    let Expr::Name(loop_name) = loop_var else {
-        return false;
-    };
-
-    for child in children(stmt) {
-        for stmt in child {
-            if find_n1(stmt, loop_var, ctx) {
-                return true;
+                self.diagnostics.extend(new_diags);
             }
         }
-    }
 
-    walk_expressions(stmt, loop_name)
-}
-
-fn evaluate_expr<'a>(expr: &'a Expr, traceback: &mut Vec<&'a Expr>) -> BindingKind {
-    traceback.push(expr);
-
-    match expr {
-        Expr::Call(call) => evaluate_expr(&call.func, traceback),
-        Expr::Attribute(attr) => {
-            if attr.attr.id.as_str() == "objects" {
-                let mut state = QuerySetState::Unsafe;
-                for tr in traceback {
-                    if let Expr::Call(call) = tr
-                        && let Expr::Attribute(attr) = call.func.as_ref()
-                        && ["select_related", "prefetch_related"].contains(&attr.attr.id.as_str())
-                    {
-                        state = QuerySetState::Safe;
-                        break;
-                    }
-                }
-                BindingKind::QuerySetCandidate(state)
-            } else {
-                evaluate_expr(&attr.value, traceback)
-            }
-        }
-        _ => BindingKind::Unknown,
+        ruff_python_ast::visitor::walk_expr(self, expr);
     }
 }
 
-fn evaluate_assignment(assignment: &Stmt, ctx: &mut Context) {
-    match assignment {
-        Stmt::Assign(assign) => {
-            for target in assign.targets.iter() {
-                if let Some(name) = target.as_name_expr() {
-                    let kind = evaluate_expr(&assign.value, &mut Vec::new());
-                    ctx.current_scope_mut()
-                        .expect("should exist an scope")
-                        .symbols
-                        .insert(name.id.to_string(), kind);
-                }
-            }
-        }
-        Stmt::AnnAssign(assign) => {
-            if let Some(name) = assign.target.as_name_expr()
-                && let Some(ref value) = assign.value
-            {
-                let kind = evaluate_expr(value, &mut Vec::new());
-                ctx.current_scope_mut()
-                    .expect("should exist an scope")
-                    .symbols
-                    .insert(name.id.to_string(), kind);
-            }
-        }
-        _ => {}
-    }
-}
+pub fn analyze_directory(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut total_diagnostics = 0;
 
-fn maybe_analyze(stmt: &Stmt, ctx: &mut Context) {
-    match stmt {
-        Stmt::For(for_stmt) => {
-            evaluate_for(for_stmt, ctx);
-        }
-        Stmt::Assign(_) | Stmt::AnnAssign(_) => evaluate_assignment(stmt, ctx),
-        _ => {}
-    }
-}
-
-fn children(stmt: &Stmt) -> Vec<&[Stmt]> {
-    match stmt {
-        Stmt::For(s) => vec![&s.body, &s.orelse],
-        Stmt::FunctionDef(s) => {
-            vec![&s.body]
-        }
-        Stmt::While(s) => vec![&s.body, &s.orelse],
-        Stmt::With(s) => vec![&s.body],
-        Stmt::ClassDef(s) => {
-            vec![&s.body]
-        }
-        Stmt::If(s) => {
-            let mut bodies: Vec<&[Stmt]> = vec![&s.body];
-            for clause in &s.elif_else_clauses {
-                bodies.push(&clause.body);
-            }
-            bodies
-        }
-        Stmt::Match(s) => s.cases.iter().map(|c| c.body.as_slice()).collect(),
-        Stmt::Try(s) => {
-            let mut bodies: Vec<&[Stmt]> = vec![&s.body, &s.orelse, &s.finalbody];
-            for handler in &s.handlers {
-                match handler {
-                    ruff_python_ast::ExceptHandler::ExceptHandler(h) => {
-                        bodies.push(&h.body);
-                    }
-                }
-            }
-            bodies
-        }
-        _ => vec![],
-    }
-}
-
-fn visit_stmt(stmt: &Stmt, ctx: &mut Context) {
-    match stmt {
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-            ctx.stack.push(ScopeState::new());
-        }
-        _ => {}
-    }
-
-    maybe_analyze(stmt, ctx);
-
-    for body in children(stmt) {
-        for child in body {
-            visit_stmt(child, ctx);
-        }
-    }
-
-    match stmt {
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-            ctx.stack.pop();
-        }
-        _ => {}
-    }
-}
-
-pub fn get_for_statements(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    WalkDir::new(dir)
+    for entry in WalkDir::new(dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".py"))
-        .try_for_each(|entry| {
-            let file_content = fs::read_to_string(entry.path())?;
-            let parsed = parse_module(&file_content)?;
-            let module = parsed.syntax();
-
-            let filename: String = entry
-                .path()
-                .strip_prefix(dir)
-                .unwrap()
-                .to_string_lossy()
-                .replace("/", ".")
-                .into();
-
-            let mut context = Context::new(filename);
-
-            for stmt in &module.body {
-                visit_stmt(stmt, &mut context);
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".py"))
+    {
+        let file_content = fs::read_to_string(entry.path())?;
+        let parsed = match parse_module(&file_content) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Parse error in {:?}: {}", entry.path(), e);
+                continue;
             }
+        };
 
-            Ok(())
-        })
+        let module = parsed.syntax();
+        let filename = entry
+            .path()
+            .strip_prefix(dir)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .to_string();
+
+        let mut analyzer = Analyzer::new(filename, &file_content);
+
+        for stmt in &module.body {
+            analyzer.visit_stmt(stmt);
+        }
+
+        for diag in &analyzer.diagnostics {
+            println!("{}", diag);
+            total_diagnostics += 1;
+        }
+    }
+
+    println!("\nTotal N+1 warnings: {}", total_diagnostics);
+    Ok(())
 }
