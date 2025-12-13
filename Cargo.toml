@@ -1,0 +1,11 @@
+[package]
+name = "pyesis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+walkdir = "2.5.0"
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", rev = "e19c0503866c09d8de92171d2ae3ce7f51ee80dd" }
+ruff_python_ast    = { git = "https://github.com/astral-sh/ruff", rev = "e19c0503866c09d8de92171d2ae3ce7f51ee80dd" }
+ruff_text_size     = { git = "https://github.com/astral-sh/ruff", rev = "e19c0503866c09d8de92171d2ae3ce7f51ee80dd" }
+
