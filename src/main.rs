@@ -1,4 +1,4 @@
-use ruff_python_ast::{Expr, Stmt, StmtFor};
+use ruff_python_ast::{Expr, ExprAttribute, ExprName, Stmt, StmtFor};
 use ruff_python_parser::parse_module;
 use std::collections::HashMap;
 use std::env::home_dir;
@@ -25,6 +25,7 @@ enum BindingKind {
 struct Context {
     filename: String,
     symbols: HashMap<String, BindingKind>,
+    loop_vars: HashMap<String, String>,
 }
 
 impl Context {
@@ -32,13 +33,76 @@ impl Context {
         Self {
             filename,
             symbols: HashMap::new(),
+            loop_vars: HashMap::new(),
         }
     }
 }
 
+fn is_candidate(name: &str, ctx: &Context) -> bool {
+    ctx.symbols
+        .iter()
+        .filter_map(|(n, k)| matches!(k, BindingKind::QuerySetCandidate).then_some(n.as_str()))
+        .collect::<Vec<&str>>()
+        .contains(&name)
+}
+
 fn evaluate_for(for_stmt: &StmtFor, ctx: &Context) {
     if let Expr::Name(name) = for_stmt.iter.as_ref() {
-        println!("{}", name.id.as_str());
+        if is_candidate(&name.id.as_str(), ctx) {
+            for expr in for_stmt.body.iter() {
+                if find_n1(&expr, &for_stmt.target, ctx) {
+                    println!(
+                        "[{}] {} is a N + 1 candidate!",
+                        ctx.filename,
+                        name.id.as_str()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn find_n1(stmt: &Stmt, loop_var: &Expr, ctx: &Context) -> bool {
+    let Expr::Name(loop_name) = loop_var else {
+        return false;
+    };
+
+    for child in children(stmt) {
+        for stmt in child {
+            if find_n1(stmt, loop_var, ctx) {
+                return true;
+            }
+        }
+    }
+
+    match stmt {
+        Stmt::Assign(assign) => {
+            if let Some(attr) = assign.value.as_attribute_expr() {
+                evaluate_attr_n1(attr, loop_name)
+            } else {
+                false
+            }
+        }
+        Stmt::AnnAssign(assign) => {
+            if let Some(ref value) = assign.value
+                && let Some(attr) = value.as_attribute_expr()
+            {
+                evaluate_attr_n1(attr, loop_name)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn evaluate_attr_n1(attr: &ExprAttribute, loop_name: &ExprName) -> bool {
+    match &*attr.value {
+        Expr::Attribute(attr) => evaluate_attr_n1(attr, loop_name),
+        Expr::Name(name) if name.id.as_str() == loop_name.id.as_str() => {
+            return true;
+        }
+        _ => false,
     }
 }
 
@@ -69,13 +133,11 @@ fn evaluate_assignment(assignment: &Stmt, ctx: &mut Context) {
             }
         }
         Stmt::AnnAssign(assign) => {
-            if let Some(name) = assign.target.as_name_expr() {
-                if let Some(ref value) = assign.value {
-                    let kind = evaluate_expr(value);
-                    ctx.symbols
-                        .entry(name.id.to_string())
-                        .or_insert_with(|| kind);
-                }
+            if let Some(name) = assign.target.as_name_expr()
+                && let Some(ref value) = assign.value
+            {
+                let kind = evaluate_expr(value);
+                ctx.symbols.insert(name.id.to_string(), kind);
             }
         }
         _ => {}
@@ -154,8 +216,6 @@ pub fn get_for_statements(dir: &Path) -> Result<(), Box<dyn std::error::Error>> 
             for stmt in &module.body {
                 visit_stmt(stmt, &mut context);
             }
-
-            dbg!(context);
 
             Ok(())
         })
