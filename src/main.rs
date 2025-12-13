@@ -1,3 +1,5 @@
+#![feature(if_let_guard)]
+
 use ruff_python_ast::ModModule;
 use ruff_python_ast::{Expr, Stmt, visitor::Visitor};
 use ruff_python_parser::{Parsed, parse_module};
@@ -19,8 +21,14 @@ fn main() {
 }
 
 #[derive(Debug, Clone)]
+struct SafeMethod {
+    name: String,
+    attributes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 enum QuerySetState {
-    Safe,
+    Safe(SafeMethod),
     Unsafe,
 }
 
@@ -46,7 +54,7 @@ impl ScopeState {
 #[derive(Debug, Clone)]
 struct LoopContext {
     loop_var: String,
-    unsafe_queryset: bool,
+    queryset_state: QuerySetState,
 }
 
 #[derive(Debug)]
@@ -113,12 +121,9 @@ impl<'a> Analyzer<'a> {
         None
     }
 
-    /// Check if a name refers to an unsafe queryset
-    fn is_unsafe_queryset(&self, name: &str) -> bool {
-        matches!(
-            self.lookup(name),
-            Some(BindingKind::QuerySet(QuerySetState::Unsafe))
-        )
+    /// Check if a name refers to a tracked queryset
+    fn is_tracked_queryset(&self, name: &str) -> bool {
+        matches!(self.lookup(name), Some(BindingKind::QuerySet(_)))
     }
 
     /// Classify an expression to determine if it produces a queryset and its safety
@@ -126,22 +131,20 @@ impl<'a> Analyzer<'a> {
         self.classify_expr_inner(expr, &mut Vec::new())
     }
 
-    fn classify_expr_inner(&self, expr: &Expr, chain: &mut Vec<String>) -> BindingKind {
+    fn classify_expr_inner(&self, expr: &'a Expr, chain: &mut Vec<&'a Expr>) -> BindingKind {
         match expr {
             Expr::Call(call) => {
-                // Track method name if it's an attribute call
-                if let Expr::Attribute(attr) = call.func.as_ref() {
-                    chain.push(attr.attr.id.to_string());
-                }
+                // Track method
+                chain.push(expr);
                 self.classify_expr_inner(&call.func, chain)
             }
             Expr::Attribute(attr) => {
                 if attr.attr.id.as_str() == "objects" {
                     // Found .objects - this is a queryset origin
                     // Check if any method in the chain makes it safe
-                    let is_safe = self.is_safe_method(&chain);
-                    let state = if is_safe {
-                        QuerySetState::Safe
+                    let method = self.get_safe_method(chain.as_ref());
+                    let state = if let Some(method) = method {
+                        QuerySetState::Safe(method)
                     } else {
                         QuerySetState::Unsafe
                     };
@@ -155,8 +158,10 @@ impl<'a> Analyzer<'a> {
                 if let Some(kind) = self.lookup(name.id.as_str()) {
                     // Check if the current chain of methods is safe
                     match kind {
-                        BindingKind::QuerySet(query_set_state) if self.is_safe_method(&chain) => {
-                            BindingKind::QuerySet(QuerySetState::Safe)
+                        BindingKind::QuerySet(query_set_state)
+                            if let Some(safe_method) = self.get_safe_method(&chain) =>
+                        {
+                            BindingKind::QuerySet(QuerySetState::Safe(safe_method))
                         }
                         _ => kind.clone(),
                     }
@@ -168,17 +173,55 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn is_safe_method(&self, chain: &[String]) -> bool {
-        let safe_methods = [
-            "select_related",
-            "prefetch_related",
-            "only",
-            "defer",
-            "values",
-            "values_list",
-            "iterator",
-        ];
-        chain.iter().any(|m| safe_methods.contains(&m.as_str()))
+    fn get_safe_method(&self, chain: &[&Expr]) -> Option<SafeMethod> {
+        let safe_qs_methods = ["select_related", "prefetch_related"];
+        let safe_no_qs_methods = ["values", "values_list", "iterator"];
+
+        let mut safe_method = None;
+
+        for expr in chain {
+            let Some(call) = expr.as_call_expr() else {
+                continue;
+            };
+
+            let Some(attr) = call.func.as_attribute_expr() else {
+                continue;
+            };
+
+            let name = attr.attr.id.as_str();
+            if safe_no_qs_methods.contains(&name) {
+                return Some(SafeMethod {
+                    name: attr.attr.id.to_string(),
+                    attributes: Vec::new(),
+                });
+            }
+
+            if safe_qs_methods.contains(&name) {
+                // Doesn't return directly, because we want to override if a no qs method exists
+                // TODO: Avoid allocation
+                let fields: Vec<String> = call
+                    .arguments
+                    .args
+                    .iter()
+                    .filter_map(|a| a.as_string_literal_expr())
+                    .map(|s| s.value.to_string())
+                    .collect();
+
+                let mut attributes: Vec<String> = Vec::new();
+                for field in fields {
+                    for relation in field.split("__") {
+                        attributes.push(relation.to_string());
+                    }
+                }
+
+                safe_method = Some(SafeMethod {
+                    name: name.to_string(),
+                    attributes,
+                })
+            }
+        }
+
+        safe_method
     }
 
     /// Record an assignment in the current scope
@@ -212,7 +255,7 @@ impl<'a> Analyzer<'a> {
             col,
             access: format!("{}.{}", loop_var, attr_name),
             message: format!(
-                "Potential N+1 query: accessing `{}.{}` inside loop over unoptimized queryset",
+                "Potential N+1 query: accessing `{}.{}` inside loop",
                 loop_var, attr_name
             ),
         }
@@ -242,13 +285,13 @@ impl<'a> Visitor<'a> for Analyzer<'a> {
 
                 // Check if iterating over an unsafe queryset
                 if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
-                    && self.is_unsafe_queryset(iter_name.id.as_str())
+                    && let Some(BindingKind::QuerySet(state)) = self.lookup(iter_name.id.as_str())
                     // TODO: Handle tuples or another assignment method
                     && let Expr::Name(target) = for_stmt.target.as_ref()
                 {
                     self.active_loops.push(LoopContext {
                         loop_var: target.id.to_string(),
-                        unsafe_queryset: true,
+                        queryset_state: state.clone(),
                     });
                     pushed_loop = true;
                 }
@@ -277,12 +320,30 @@ impl<'a> Visitor<'a> for Analyzer<'a> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         if let Expr::Attribute(attr) = expr {
             if let Expr::Name(name) = attr.value.as_ref() {
-                let new_diags: Vec<_> = self
-                    .active_loops
-                    .iter()
-                    .filter(|ctx| ctx.unsafe_queryset && name.id.as_str() == ctx.loop_var)
-                    .map(|ctx| self.make_n1_diagnostic(expr, &ctx.loop_var, attr.attr.id.as_str()))
-                    .collect();
+                let mut new_diags: Vec<_> = Vec::new();
+                for ctx in self.active_loops.iter() {
+                    if name.id.as_str() == ctx.loop_var {
+                        let attr_name = attr.attr.id.as_str();
+                        match &ctx.queryset_state {
+                            QuerySetState::Unsafe => {
+                                new_diags.push(self.make_n1_diagnostic(
+                                    expr,
+                                    &ctx.loop_var,
+                                    attr_name,
+                                ));
+                            }
+                            QuerySetState::Safe(method) => {
+                                if !method.attributes.iter().any(|a| a == attr_name) {
+                                    new_diags.push(self.make_n1_diagnostic(
+                                        expr,
+                                        &ctx.loop_var,
+                                        attr_name,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
 
                 self.diagnostics.extend(new_diags);
             }
@@ -370,11 +431,36 @@ for t in tier1:
     }
 
     #[test]
+    fn detect_false_safe() {
+        let source = r#"
+theo_analysis = TheoAnalysis.objects.filter(id=analysis_id, tier=Tiers.TIER1).first()
+tier1 = theo_analysis.tier1s.filter(
+    failed_reasons__isnull=True).prefetch_related('other_stuff')
+
+for t in tier1:
+    for rp in t.relative_performances.all():
+        pass
+        "#;
+
+        let parser = Parser::new();
+        let parsed = parser.parse_module(&source).expect("should be parsed");
+        let module = parsed.syntax();
+
+        let mut analyzer = Analyzer::new("test".into(), &source);
+
+        for stmt in &module.body {
+            analyzer.visit_stmt(stmt);
+        }
+
+        assert_eq!(analyzer.diagnostics.len(), 1);
+    }
+
+    #[test]
     fn avoid_false_positive() {
         let source = r#"
 theo_analysis = TheoAnalysis.objects.filter(id=analysis_id, tier=Tiers.TIER1).first()
 tier1 = theo_analysis.tier1s.filter(
-    failed_reasons__isnull=True).select_related('ticker').prefetch_related('relative_performances')
+    failed_reasons__isnull=True).prefetch_related('relative_performances')
 
 for t in tier1:
     for rp in t.relative_performances.all():
