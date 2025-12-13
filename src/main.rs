@@ -9,7 +9,7 @@ use walkdir::WalkDir;
 
 fn main() {
     let home = home_dir().unwrap();
-    let path = home.join("dev/ddirt/development/app");
+    let path = home.join("dev/agora_hedge/main/app");
 
     if let Err(e) = analyze_directory(&path) {
         eprintln!("Error: {}", e);
@@ -52,6 +52,7 @@ struct Diagnostic {
     filename: String,
     line: usize,
     col: usize,
+    access: String,
     message: String,
 }
 
@@ -59,8 +60,8 @@ impl std::fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}:{}:{}: {}",
-            self.filename, self.line, self.col, self.message
+            "{}:{}:{}: --> {} \n{}",
+            self.filename, self.line, self.col, self.access, self.message
         )
     }
 }
@@ -198,6 +199,7 @@ impl<'a> Analyzer<'a> {
             filename: self.filename.clone(),
             line,
             col,
+            access: format!("{}.{}", loop_var, attr_name),
             message: format!(
                 "Potential N+1 query: accessing `{}.{}` inside loop over unoptimized queryset",
                 loop_var, attr_name
@@ -228,19 +230,18 @@ impl<'a> Visitor<'a> for Analyzer<'a> {
                 let mut pushed_loop = false;
 
                 // Check if iterating over an unsafe queryset
-                if let Expr::Name(iter_name) = for_stmt.iter.as_ref() {
-                    if self.is_unsafe_queryset(iter_name.id.as_str()) {
-                        if let Expr::Name(target) = for_stmt.target.as_ref() {
-                            self.active_loops.push(LoopContext {
-                                loop_var: target.id.to_string(),
-                                unsafe_queryset: true,
-                            });
-                            pushed_loop = true;
-                        }
-                    }
+                if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
+                    && self.is_unsafe_queryset(iter_name.id.as_str())
+                    // TODO: Handle tuples or another assignment method
+                    && let Expr::Name(target) = for_stmt.target.as_ref()
+                {
+                    self.active_loops.push(LoopContext {
+                        loop_var: target.id.to_string(),
+                        unsafe_queryset: true,
+                    });
+                    pushed_loop = true;
                 }
 
-                // Traverse the loop body with context active
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
 
                 if pushed_loop {
@@ -255,7 +256,7 @@ impl<'a> Visitor<'a> for Analyzer<'a> {
                 self.pop_scope();
             }
 
-            // Default: just walk
+            // default: just walk
             _ => {
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
             }
@@ -312,7 +313,7 @@ pub fn analyze_directory(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         for diag in &analyzer.diagnostics {
-            println!("{}", diag);
+            println!("{}\n", diag);
             total_diagnostics += 1;
         }
     }
