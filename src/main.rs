@@ -1,5 +1,6 @@
+use ruff_python_ast::ModModule;
 use ruff_python_ast::{Expr, Stmt, visitor::Visitor};
-use ruff_python_parser::parse_module;
+use ruff_python_parser::{Parsed, parse_module};
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
 use std::env::home_dir;
@@ -10,8 +11,9 @@ use walkdir::WalkDir;
 fn main() {
     let home = home_dir().unwrap();
     let path = home.join("dev/agora_hedge/main/app");
+    let parser = Parser::new();
 
-    if let Err(e) = analyze_directory(&path) {
+    if let Err(e) = parser.analyze_directory(&path) {
         eprintln!("Error: {}", e);
     }
 }
@@ -137,17 +139,7 @@ impl<'a> Analyzer<'a> {
                 if attr.attr.id.as_str() == "objects" {
                     // Found .objects - this is a queryset origin
                     // Check if any method in the chain makes it safe
-                    let safe_methods = [
-                        "select_related",
-                        "prefetch_related",
-                        "only",
-                        "defer",
-                        "values",
-                        "values_list",
-                        "iterator",
-                    ];
-
-                    let is_safe = chain.iter().any(|m| safe_methods.contains(&m.as_str()));
+                    let is_safe = self.is_safe_method(&chain);
                     let state = if is_safe {
                         QuerySetState::Safe
                     } else {
@@ -161,13 +153,32 @@ impl<'a> Analyzer<'a> {
             Expr::Name(name) => {
                 // Propagate binding kind if we're chaining off a known queryset
                 if let Some(kind) = self.lookup(name.id.as_str()) {
-                    kind.clone()
+                    // Check if the current chain of methods is safe
+                    match kind {
+                        BindingKind::QuerySet(query_set_state) if self.is_safe_method(&chain) => {
+                            BindingKind::QuerySet(QuerySetState::Safe)
+                        }
+                        _ => kind.clone(),
+                    }
                 } else {
                     BindingKind::Unknown
                 }
             }
             _ => BindingKind::Unknown,
         }
+    }
+
+    fn is_safe_method(&self, chain: &[String]) -> bool {
+        let safe_methods = [
+            "select_related",
+            "prefetch_related",
+            "only",
+            "defer",
+            "values",
+            "values_list",
+            "iterator",
+        ];
+        chain.iter().any(|m| safe_methods.contains(&m.as_str()))
     }
 
     /// Record an assignment in the current scope
@@ -281,43 +292,105 @@ impl<'a> Visitor<'a> for Analyzer<'a> {
     }
 }
 
-pub fn analyze_directory(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut total_diagnostics = 0;
+struct Parser;
 
-    for entry in WalkDir::new(dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".py"))
-    {
-        let file_content = fs::read_to_string(entry.path())?;
-        let parsed = match parse_module(&file_content) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Parse error in {:?}: {}", entry.path(), e);
-                continue;
+impl Parser {
+    fn new() -> Self {
+        Self
+    }
+
+    pub fn parse_module(
+        &self,
+        file_content: &str,
+    ) -> Result<Parsed<ModModule>, Box<dyn std::error::Error>> {
+        Ok(parse_module(file_content)?)
+    }
+
+    pub fn analyze_directory(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let mut total_diagnostics = 0;
+
+        for entry in WalkDir::new(dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".py"))
+        {
+            let file_content = fs::read_to_string(entry.path())?;
+            let parsed = self.parse_module(&file_content)?;
+            let module = parsed.syntax();
+            let filename = entry
+                .path()
+                .strip_prefix(dir)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .to_string();
+
+            let mut analyzer = Analyzer::new(filename, &file_content);
+
+            for stmt in &module.body {
+                analyzer.visit_stmt(stmt);
             }
-        };
 
+            for diag in &analyzer.diagnostics {
+                println!("{}\n", diag);
+                total_diagnostics += 1;
+            }
+        }
+
+        println!("\nTotal N+1 warnings: {}", total_diagnostics);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_positive() {
+        let source = r#"
+theo_analysis = TheoAnalysis.objects.filter(id=analysis_id, tier=Tiers.TIER1).first()
+tier1 = theo_analysis.tier1s.filter(failed_reasons__isnull=True)
+
+for t in tier1:
+    for rp in t.relative_performances.all():
+        pass
+        "#;
+
+        let parser = Parser::new();
+        let parsed = parser.parse_module(&source).expect("should be parsed");
         let module = parsed.syntax();
-        let filename = entry
-            .path()
-            .strip_prefix(dir)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .to_string();
 
-        let mut analyzer = Analyzer::new(filename, &file_content);
+        let mut analyzer = Analyzer::new("test".into(), &source);
 
         for stmt in &module.body {
             analyzer.visit_stmt(stmt);
         }
 
-        for diag in &analyzer.diagnostics {
-            println!("{}\n", diag);
-            total_diagnostics += 1;
-        }
+        assert_eq!(analyzer.diagnostics.len(), 1);
     }
 
-    println!("\nTotal N+1 warnings: {}", total_diagnostics);
-    Ok(())
+    #[test]
+    fn avoid_false_positive() {
+        let source = r#"
+theo_analysis = TheoAnalysis.objects.filter(id=analysis_id, tier=Tiers.TIER1).first()
+tier1 = theo_analysis.tier1s.filter(
+    failed_reasons__isnull=True).select_related('ticker').prefetch_related('relative_performances')
+
+for t in tier1:
+    for rp in t.relative_performances.all():
+        pass
+        "#;
+
+        let parser = Parser::new();
+        let parsed = parser.parse_module(&source).expect("should be parsed");
+        let module = parsed.syntax();
+
+        let mut analyzer = Analyzer::new("test".into(), &source);
+
+        for stmt in &module.body {
+            analyzer.visit_stmt(stmt);
+        }
+
+        assert!(analyzer.diagnostics.is_empty());
+    }
 }
