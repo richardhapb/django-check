@@ -1,0 +1,308 @@
+//! Django model dependency graph extraction pass.
+//!
+//! Extracts Django model definitions and their relationships by parsing:
+//! - Class definitions inheriting from models.Model
+//! - ForeignKey, OneToOneField, ManyToManyField declarations
+//! - related_name and other field options
+
+use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
+use ruff_text_size::Ranged;
+
+use crate::ir::model::{ModelDef, ModelGraph, Relation, RelationType};
+use crate::passes::Pass;
+
+const RELATION_FIELDS: [(&str, RelationType); 4] = [
+    ("ForeignKey", RelationType::ForeignKey),
+    ("OneToOneField", RelationType::OneToOne),
+    ("ManyToManyField", RelationType::ManyToMany),
+    ("GenericForeignKey", RelationType::GenericForeignKey),
+];
+
+pub struct ModelGraphPass<'a> {
+    filename: &'a str,
+    source: &'a str,
+    graph: ModelGraph,
+    current_model: Option<ModelDef>,
+}
+
+impl<'a> ModelGraphPass<'a> {
+    pub fn new(filename: &'a str, source: &'a str) -> Self {
+        Self {
+            filename,
+            source,
+            graph: ModelGraph::new(),
+            current_model: None,
+        }
+    }
+
+    fn line_number(&self, offset: usize) -> usize {
+        self.source[..offset].chars().filter(|&c| c == '\n').count() + 1
+    }
+
+    /// Check if a class inherits from models.Model (or similar)
+    fn is_django_model(&self, bases: &[Expr]) -> bool {
+        for base in bases {
+            match base {
+                // models.Model
+                Expr::Attribute(attr) => {
+                    if attr.attr.id.as_str() == "Model" {
+                        if let Expr::Name(name) = attr.value.as_ref() {
+                            if name.id.as_str() == "models" {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                // Direct Model import or custom base class
+                Expr::Name(name) => {
+                    let n = name.id.as_str();
+                    // Common patterns: Model, BaseModel, AbstractModel, etc.
+                    if n == "Model" || n.ends_with("Model") || n.ends_with("Base") {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Extract relation type from a field call
+    fn get_relation_type(&self, call: &ruff_python_ast::ExprCall) -> Option<RelationType> {
+        let name = match call.func.as_ref() {
+            // models.ForeignKey(...)
+            Expr::Attribute(attr) => attr.attr.id.as_str(),
+            // ForeignKey(...) - direct import
+            Expr::Name(name) => name.id.as_str(),
+            _ => return None,
+        };
+
+        RELATION_FIELDS
+            .iter()
+            .find(|(field_name, _)| *field_name == name)
+            .map(|(_, rel_type)| rel_type.clone())
+    }
+
+    /// Extract the target model from a relation field
+    fn extract_target_model(&self, call: &ruff_python_ast::ExprCall) -> Option<String> {
+        // First positional argument is the target model
+        let first_arg = call.arguments.args.first()?;
+
+        match first_arg {
+            // String reference: ForeignKey('ModelName') or ForeignKey('app.ModelName')
+            Expr::StringLiteral(s) => {
+                let value = s.value.to_string();
+                // Handle 'app.Model' format - take the model name
+                Some(value.split('.').last().unwrap_or(&value).to_string())
+            }
+            // Direct reference: ForeignKey(ModelName)
+            Expr::Name(name) => Some(name.id.to_string()),
+            // models.Model style isn't typically used for FK targets but handle it
+            Expr::Attribute(attr) => Some(attr.attr.id.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Extract related_name from field kwargs
+    fn extract_related_name(&self, call: &ruff_python_ast::ExprCall) -> Option<String> {
+        for keyword in call.arguments.keywords.iter() {
+            if let Some(arg) = &keyword.arg {
+                if arg.as_str() == "related_name" {
+                    if let Expr::StringLiteral(s) = &keyword.value {
+                        return Some(s.value.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Process a class body statement to find relation fields
+    fn process_class_body_stmt(&mut self, stmt: &Stmt) {
+        // Looking for: field_name = models.ForeignKey(...)
+        let Stmt::Assign(assign) = stmt else { return };
+
+        // Get field name
+        let Some(Expr::Name(target)) = assign.targets.first() else {
+            return;
+        };
+        let field_name = target.id.to_string();
+
+        // Get the call expression
+        let Expr::Call(call) = assign.value.as_ref() else {
+            return;
+        };
+
+        // Check if it's a relation field
+        let Some(relation_type) = self.get_relation_type(call) else {
+            return;
+        };
+
+        // Extract target model
+        let Some(target_model) = self.extract_target_model(call) else {
+            return;
+        };
+
+        let related_name = self.extract_related_name(call);
+
+        let relation = Relation {
+            field_name,
+            target_model,
+            relation_type,
+            related_name,
+        };
+
+        if let Some(ref mut model) = self.current_model {
+            model.add_relation(relation);
+        }
+    }
+}
+
+impl<'a> Pass<'a> for ModelGraphPass<'a> {
+    type Output = ModelGraph;
+
+    fn run(&mut self, module: &'a ModModule) -> Self::Output {
+        for stmt in &module.body {
+            self.visit_stmt(stmt);
+        }
+        std::mem::take(&mut self.graph)
+    }
+}
+
+impl<'a> Visitor<'a> for ModelGraphPass<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::ClassDef(class) => {
+                if self.is_django_model(
+                    &class
+                        .arguments
+                        .as_ref()
+                        .map(|args| args.args.iter().map(|a| a.clone()).collect::<Vec<_>>())
+                        .unwrap_or_default(),
+                ) {
+                    let line = self.line_number(class.range().start().to_usize());
+                    self.current_model =
+                        Some(ModelDef::new(class.name.to_string(), self.filename, line));
+
+                    // Process class body
+                    for body_stmt in &class.body {
+                        self.process_class_body_stmt(body_stmt);
+                    }
+
+                    // Finalize model
+                    if let Some(model) = self.current_model.take() {
+                        self.graph.add_model(model);
+                    }
+                }
+            }
+            _ => {
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ruff_python_parser::parse_module;
+
+    fn run_pass(source: &str) -> ModelGraph {
+        let parsed = parse_module(source).expect("should parse");
+        let mut pass = ModelGraphPass::new("test.py", source);
+        pass.run(parsed.syntax())
+    }
+
+    #[test]
+    fn extract_simple_model() {
+        let source = r#"
+from django.db import models
+
+class User(models.Model):
+    name = models.CharField(max_length=100)
+"#;
+        let graph = run_pass(source);
+        assert_eq!(graph.model_count(), 1);
+        assert!(graph.get("User").is_some());
+    }
+
+    #[test]
+    fn extract_foreign_key() {
+        let source = r#"
+from django.db import models
+
+class Order(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, related_name='orders')
+"#;
+        let graph = run_pass(source);
+        let order = graph.get("Order").expect("Order should exist");
+
+        assert_eq!(order.relations.len(), 2);
+
+        let user_rel = &order.relations[0];
+        assert_eq!(user_rel.field_name, "user");
+        assert_eq!(user_rel.target_model, "User");
+        assert_eq!(user_rel.relation_type, RelationType::ForeignKey);
+
+        let product_rel = &order.relations[1];
+        assert_eq!(product_rel.field_name, "product");
+        assert_eq!(product_rel.target_model, "Product");
+        assert_eq!(product_rel.related_name, Some("orders".into()));
+    }
+
+    #[test]
+    fn extract_multiple_relation_types() {
+        let source = r#"
+class Profile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    
+class Article(models.Model):
+    author = models.ForeignKey(User, on_delete=models.CASCADE)
+    tags = models.ManyToManyField(Tag)
+"#;
+        let graph = run_pass(source);
+
+        let profile = graph.get("Profile").unwrap();
+        assert_eq!(profile.relations[0].relation_type, RelationType::OneToOne);
+
+        let article = graph.get("Article").unwrap();
+        assert_eq!(article.relations.len(), 2);
+        assert_eq!(article.relations[0].relation_type, RelationType::ForeignKey);
+        assert_eq!(article.relations[1].relation_type, RelationType::ManyToMany);
+    }
+
+    #[test]
+    fn dependents_query() {
+        let source = r#"
+class User(models.Model):
+    name = models.CharField()
+
+class Order(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+
+class Profile(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+"#;
+        let graph = run_pass(source);
+        let dependents = graph.dependents("User");
+
+        assert_eq!(dependents.len(), 2);
+        let names: Vec<_> = dependents.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Order"));
+        assert!(names.contains(&"Profile"));
+    }
+
+    #[test]
+    fn string_reference_with_app_label() {
+        let source = r#"
+class Order(models.Model):
+    user = models.ForeignKey('accounts.User', on_delete=models.CASCADE)
+"#;
+        let graph = run_pass(source);
+        let order = graph.get("Order").unwrap();
+
+        // Should extract just "User" from "accounts.User"
+        assert_eq!(order.relations[0].target_model, "User");
+    }
+}
