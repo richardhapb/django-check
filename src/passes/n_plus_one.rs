@@ -10,7 +10,10 @@ use ruff_text_size::Ranged;
 use std::collections::HashMap;
 
 use crate::diagnostic::Diagnostic;
-use crate::ir::binding::{BindingKind, QuerySetState, SafeMethod, parse_relation_fields};
+use crate::ir::binding::{
+    BindingKind, QuerySetContext, QuerySetState, SafeMethod, parse_relation_fields,
+};
+use crate::ir::model::ModelGraph;
 use crate::passes::Pass;
 
 const DIAGNOSTIC_CODE: &str = "N+1";
@@ -18,7 +21,7 @@ const DIAGNOSTIC_CODE: &str = "N+1";
 #[derive(Debug, Clone)]
 struct LoopContext {
     loop_var: String,
-    queryset_state: QuerySetState,
+    queryset_context: QuerySetContext,
 }
 
 #[derive(Debug)]
@@ -38,15 +41,17 @@ pub struct NPlusOnePass<'a> {
     filename: &'a str,
     source: &'a str,
     scopes: Vec<ScopeState>,
+    model_graph: &'a ModelGraph,
     active_loops: Vec<LoopContext>,
     diagnostics: Vec<Diagnostic>,
 }
 
 impl<'a> NPlusOnePass<'a> {
-    pub fn new(filename: &'a str, source: &'a str) -> Self {
+    pub fn new(filename: &'a str, source: &'a str, model_graph: &'a ModelGraph) -> Self {
         Self {
             filename,
             source,
+            model_graph,
             scopes: vec![ScopeState::new()],
             active_loops: Vec::new(),
             diagnostics: Vec::new(),
@@ -78,16 +83,16 @@ impl<'a> NPlusOnePass<'a> {
         None
     }
 
-    fn record_assignment(&mut self, target: &Expr, value: &Expr) {
+    fn record_assignment(&mut self, target: &'a Expr, value: &'a Expr) {
+        let kind = self.classify_expr(value);
         if let Expr::Name(name) = target {
-            let kind = self.classify_expr(value);
             self.current_scope_mut()
                 .symbols
                 .insert(name.id.to_string(), kind);
         }
     }
 
-    fn classify_expr(&self, expr: &Expr) -> BindingKind {
+    fn classify_expr(&self, expr: &'a Expr) -> BindingKind {
         self.classify_expr_inner(expr, &mut Vec::new())
     }
 
@@ -100,11 +105,20 @@ impl<'a> NPlusOnePass<'a> {
             Expr::Attribute(attr) => {
                 if attr.attr.id.as_str() == "objects" {
                     let method = self.get_safe_method(chain);
+
+                    let model = if let Expr::Name(name) = attr.value.as_ref() {
+                        self.model_graph
+                            .models()
+                            .find(|m| m.name == name.id.as_str())
+                            .map(|m| m.name.clone())
+                    } else {
+                        None
+                    };
                     let state = match method {
                         Some(m) => QuerySetState::Safe(m),
                         None => QuerySetState::Unsafe,
                     };
-                    BindingKind::QuerySet(state)
+                    BindingKind::QuerySet(QuerySetContext { state, model })
                 } else {
                     self.classify_expr_inner(&attr.value, chain)
                 }
@@ -112,10 +126,13 @@ impl<'a> NPlusOnePass<'a> {
             Expr::Name(name) => {
                 if let Some(kind) = self.lookup(name.id.as_str()) {
                     match kind {
-                        BindingKind::QuerySet(_) if self.get_safe_method(chain).is_some() => {
-                            BindingKind::QuerySet(QuerySetState::Safe(
-                                self.get_safe_method(chain).unwrap(),
-                            ))
+                        BindingKind::QuerySet(ctx)
+                            if let Some(safe_method) = self.get_safe_method(chain) =>
+                        {
+                            BindingKind::QuerySet(QuerySetContext {
+                                state: QuerySetState::Safe(safe_method),
+                                model: ctx.model.clone(),
+                            })
                         }
                         _ => kind.clone(),
                     }
@@ -215,12 +232,12 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 let mut pushed_loop = false;
 
                 if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
-                    && let Some(BindingKind::QuerySet(state)) = self.lookup(iter_name.id.as_str())
+                    && let Some(BindingKind::QuerySet(context)) = self.lookup(iter_name.id.as_str())
                     && let Expr::Name(target) = for_stmt.target.as_ref()
                 {
                     self.active_loops.push(LoopContext {
                         loop_var: target.id.to_string(),
-                        queryset_state: state.clone(),
+                        queryset_context: context.clone(),
                     });
                     pushed_loop = true;
                 }
@@ -253,13 +270,19 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                     continue;
                 }
 
-                let should_warn = match &ctx.queryset_state {
-                    QuerySetState::Unsafe => true,
+                let is_relation = ctx.queryset_context.model.as_ref().is_some_and(|m| {
+                    self.model_graph
+                        .get_model_relations(m.as_str())
+                        .iter()
+                        .any(|r| *r == attr_name)
+                });
+
+                let should_warn = match &ctx.queryset_context.state {
+                    QuerySetState::Unsafe => is_relation,
                     QuerySetState::Safe(method) => {
-                        !method.prefetched_relations.iter().any(|a| a == attr_name)
+                        is_relation && !method.prefetched_relations.iter().any(|a| a == attr_name)
                     }
                 };
-
                 if should_warn {
                     self.diagnostics
                         .push(self.make_diagnostic(expr, &ctx.loop_var, attr_name));
@@ -273,12 +296,17 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::passes::model_graph::ModelGraphPass;
+
     use super::*;
     use ruff_python_parser::parse_module;
 
     fn run_pass(source: &str) -> Vec<Diagnostic> {
         let parsed = parse_module(source).expect("should parse");
-        let mut pass = NPlusOnePass::new("test.py", source);
+        let mut graph_pass = ModelGraphPass::new("test.py", source);
+        let graph = graph_pass.run(parsed.syntax());
+
+        let mut pass = NPlusOnePass::new("test.py", source, &graph);
         pass.run(parsed.syntax())
     }
 

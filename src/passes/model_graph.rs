@@ -40,17 +40,16 @@ impl<'a> ModelGraphPass<'a> {
     }
 
     /// Check if a class inherits from models.Model (or similar)
-    fn is_django_model(&self, bases: &[Expr]) -> bool {
+    fn is_django_model(&self, bases: impl Iterator<Item = &'a Expr>) -> bool {
         for base in bases {
             match base {
                 // models.Model
                 Expr::Attribute(attr) => {
-                    if attr.attr.id.as_str() == "Model" {
-                        if let Expr::Name(name) = attr.value.as_ref() {
-                            if name.id.as_str() == "models" {
-                                return true;
-                            }
-                        }
+                    if attr.attr.id.as_str() == "Model"
+                        && let Expr::Name(name) = attr.value.as_ref()
+                        && name.id.as_str() == "models"
+                    {
+                        return true;
                     }
                 }
                 // Direct Model import or custom base class
@@ -106,12 +105,11 @@ impl<'a> ModelGraphPass<'a> {
     /// Extract related_name from field kwargs
     fn extract_related_name(&self, call: &ruff_python_ast::ExprCall) -> Option<String> {
         for keyword in call.arguments.keywords.iter() {
-            if let Some(arg) = &keyword.arg {
-                if arg.as_str() == "related_name" {
-                    if let Expr::StringLiteral(s) = &keyword.value {
-                        return Some(s.value.to_string());
-                    }
-                }
+            if let Some(arg) = &keyword.arg
+                && arg.as_str() == "related_name"
+                && let Expr::StringLiteral(s) = &keyword.value
+            {
+                return Some(s.value.to_string());
             }
         }
         None
@@ -123,22 +121,23 @@ impl<'a> ModelGraphPass<'a> {
         let Stmt::Assign(assign) = stmt else { return };
 
         // Get field name
+        // user = models.ForeignKey(...)
+        // ^^^^
         let Some(Expr::Name(target)) = assign.targets.first() else {
             return;
         };
         let field_name = target.id.to_string();
 
         // Get the call expression
+        // user = models.ForeignKey(...)
+        //        ^^^^^^^^^^^^^^^^^^^^^^
         let Expr::Call(call) = assign.value.as_ref() else {
             return;
         };
 
-        // Check if it's a relation field
         let Some(relation_type) = self.get_relation_type(call) else {
             return;
         };
-
-        // Extract target model
         let Some(target_model) = self.extract_target_model(call) else {
             return;
         };
@@ -173,19 +172,13 @@ impl<'a> Visitor<'a> for ModelGraphPass<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         match stmt {
             Stmt::ClassDef(class) => {
-                if self.is_django_model(
-                    &class
-                        .arguments
-                        .as_ref()
-                        .map(|args| args.args.iter().map(|a| a.clone()).collect::<Vec<_>>())
-                        .unwrap_or_default(),
-                ) {
+                if self.is_django_model(class.arguments.iter().flat_map(|args| args.args.iter())) {
                     let line = self.line_number(class.range().start().to_usize());
                     self.current_model =
                         Some(ModelDef::new(class.name.to_string(), self.filename, line));
 
                     // Process class body
-                    for body_stmt in &class.body {
+                    for body_stmt in class.body.iter() {
                         self.process_class_body_stmt(body_stmt);
                     }
 
@@ -224,6 +217,16 @@ class User(models.Model):
         let graph = run_pass(source);
         assert_eq!(graph.model_count(), 1);
         assert!(graph.get("User").is_some());
+    }
+
+    #[test]
+    fn doesnt_extract_no_model_class() {
+        let source = r#"
+class User:
+    name = "test"
+"#;
+        let graph = run_pass(source);
+        assert_eq!(graph.model_count(), 0);
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! Binding-level intermediate representation for tracking variable states.
 
 #[derive(Debug, Clone)]
+pub struct QuerySetContext {
+    pub model: Option<String>,
+    pub state: QuerySetState,
+}
+
+#[derive(Debug, Clone)]
 pub struct SafeMethod {
     pub name: String,
     pub prefetched_relations: Vec<String>,
@@ -16,7 +22,7 @@ pub enum QuerySetState {
 
 #[derive(Debug, Clone)]
 pub enum BindingKind {
-    QuerySet(QuerySetState),
+    QuerySet(QuerySetContext),
     Unknown,
 }
 

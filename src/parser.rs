@@ -33,13 +33,24 @@ impl Parser {
     ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
         let mut all_diagnostics = Vec::new();
 
+        let mut global_graph = ModelGraph::new();
         for entry in Self::python_files(dir) {
             let source = fs::read_to_string(entry.path())?;
             let parsed = self.parse_module(&source)?;
             let filename = Self::relative_path(dir, entry.path());
 
-            let mut pass = NPlusOnePass::new(&filename, &source);
-            let diagnostics = pass.run(parsed.syntax());
+            let mut graph_pass = ModelGraphPass::new(&filename, &source);
+            let file_graph = graph_pass.run(parsed.syntax());
+            global_graph.merge(file_graph);
+        }
+
+        for entry in Self::python_files(dir) {
+            let source = fs::read_to_string(entry.path())?;
+            let parsed = self.parse_module(&source)?;
+            let filename = Self::relative_path(dir, entry.path());
+
+            let mut n1_pass = NPlusOnePass::new(&filename, &source, &global_graph);
+            let diagnostics = n1_pass.run(parsed.syntax());
             all_diagnostics.extend(diagnostics);
         }
 

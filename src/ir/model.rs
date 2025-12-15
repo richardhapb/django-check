@@ -75,6 +75,30 @@ impl ModelGraph {
         self.models.len()
     }
 
+    pub fn get_model_relations(&self, model_name: &str) -> Vec<&str> {
+        let mut result = Vec::new();
+
+        // Forward: fields on this model pointing to others
+        if let Some(model) = self.models.get(model_name) {
+            for r in &model.relations {
+                result.push(r.field_name.as_str());
+            }
+        }
+
+        // Reverse: related_names from models pointing to this one
+        for m in self.dependents(model_name) {
+            for r in &m.relations {
+                if r.target_model == model_name {
+                    if let Some(related_name) = &r.related_name {
+                        result.push(related_name.as_str());
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
     /// Get all models that depend on the given model (reverse dependencies)
     pub fn dependents(&self, model_name: &str) -> Vec<&ModelDef> {
         self.models
@@ -109,9 +133,7 @@ impl ModelGraph {
 
     /// Merge another graph into this one
     pub fn merge(&mut self, other: ModelGraph) {
-        for (name, model) in other.models {
-            self.models.entry(name).or_insert(model);
-        }
+        self.models.extend(other.models);
     }
 }
 
