@@ -102,15 +102,12 @@ impl<'a> NPlusOnePass<'a> {
                 chain.push(expr);
                 self.classify_expr_inner(&call.func, chain)
             }
-            Expr::Attribute(attr) => {
-                if attr.attr.id.as_str() == "objects" {
+            Expr::Attribute(attr) => match attr.attr.id.as_str() {
+                "objects" => {
                     let method = self.get_safe_method(chain);
 
                     let model = if let Expr::Name(name) = attr.value.as_ref() {
-                        self.model_graph
-                            .models()
-                            .find(|m| m.name == name.id.as_str())
-                            .map(|m| m.name.clone())
+                        self.model_graph.get(&name.id).map(|m| m.name.clone())
                     } else {
                         None
                     };
@@ -119,10 +116,70 @@ impl<'a> NPlusOnePass<'a> {
                         None => QuerySetState::Unsafe,
                     };
                     BindingKind::QuerySet(QuerySetContext { state, model })
-                } else {
-                    self.classify_expr_inner(&attr.value, chain)
                 }
-            }
+                attr_name => {
+                    if let Some(name) = attr.value.as_name_expr()
+                        && let Some(kind) = self.lookup(&name.id)
+                    {
+                        // This matches <myinstance.related_models> access trough a model instance
+                        //        name-> ^^^^^^^^^^ ^^^^^^^^^^^^^^ <- related_model
+                        // where name=myinstance and attr_name=related_models
+
+                        match kind {
+                            BindingKind::QuerySet(ctx) if let Some(ref model) = ctx.model => {
+                                if self
+                                    .model_graph
+                                    .get_model_relations(model.as_str())
+                                    .iter()
+                                    .any(|&r| r == attr_name)
+                                {
+                                    let is_safe = match &ctx.state {
+                                        QuerySetState::Safe(safe_method) => safe_method
+                                            .prefetched_relations
+                                            .iter()
+                                            .any(|r| r.as_str() == attr_name),
+                                        QuerySetState::Unsafe => false,
+                                    };
+
+                                    let safe_method = self.get_safe_method(chain);
+
+                                    if let Some(safe_method) = safe_method
+                                        && is_safe
+                                    {
+                                        let ctx = QuerySetContext {
+                                            state: QuerySetState::Safe(safe_method),
+                                            model: Some(model.clone()),
+                                        };
+                                        BindingKind::QuerySet(ctx)
+                                    } else {
+                                        let model =
+                                            self.model_graph.models().into_iter().find(|m| {
+                                                m.relations.iter().any(|r| {
+                                                    r.related_name
+                                                        .as_ref()
+                                                        .map(|rn| rn == attr_name)
+                                                        .is_some()
+                                                })
+                                            });
+
+                                        let ctx = QuerySetContext {
+                                            state: QuerySetState::Unsafe,
+                                            model: model.map(|m| m.name.clone()),
+                                        };
+
+                                        BindingKind::QuerySet(ctx)
+                                    }
+                                } else {
+                                    BindingKind::Unknown
+                                }
+                            }
+                            kind => kind.clone(),
+                        }
+                    } else {
+                        self.classify_expr_inner(&attr.value, chain)
+                    }
+                }
+            },
             Expr::Name(name) => {
                 if let Some(kind) = self.lookup(name.id.as_str()) {
                     match kind {
@@ -312,8 +369,12 @@ mod tests {
 
     #[test]
     fn detect_unsafe_loop() {
+        // Exists a relation to App
         let source = r#"
-qs = Model.objects.filter(active=True)
+class User(Model):
+    related_field = models.ForeignKey("some.App")
+
+qs = User.objects.filter(active=True)
 for item in qs:
     print(item.related_field)
 "#;
@@ -325,7 +386,10 @@ for item in qs:
     #[test]
     fn safe_with_prefetch() {
         let source = r#"
-qs = Model.objects.filter(active=True).prefetch_related('related_field')
+class User(Model):
+    related_field = models.ForeignKey("some.App")
+
+qs = User.objects.filter(active=True).prefetch_related('related_field')
 for item in qs:
     print(item.related_field)
 "#;
@@ -336,7 +400,10 @@ for item in qs:
     #[test]
     fn warn_on_unprefetched_field() {
         let source = r#"
-qs = Model.objects.filter(active=True).prefetch_related('other_field')
+class User(Model):
+    related_field = models.ForeignKey("some.App")
+
+qs = User.objects.filter(active=True).prefetch_related('other_field')
 for item in qs:
     print(item.related_field)
 "#;
@@ -345,12 +412,123 @@ for item in qs:
     }
 
     #[test]
+    fn reverse_lookup_detection() {
+        let source = r#"
+class TheoAnalysis(Model):
+    name = models.CharField(max_length=20)
+
+class Performance(Model):
+    analysis = models.ForeignKey("some.TheoAnalysis", related_name="relative_performances")
+
+tier1 = TheoAnalysis.objects.filter(id__gt=1)
+for t in tier1:
+    perfs = t.relative_performances
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
     fn nested_loop_detection() {
         let source = r#"
-tier1 = TheoAnalysis.objects.filter(id=1).first().tier1s.all()
+class TheoAnalysis(Model):
+    name = models.CharField(max_length=20)
+
+class Performance(Model):
+    analysis = models.ForeignKey("some.TheoAnalysis", related_name="relative_performances")
+
+tier1 = TheoAnalysis.objects.filter(id__gt=1)
 for t in tier1:
     for rp in t.relative_performances.all():
         pass
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn many_to_many_relation_unprefetched_warning() {
+        let source = r#"
+class TheoAnalysis(Model):
+    name = models.CharField(max_length=20)
+
+class Performance(Model):
+    analysis = models.ManyToManyField("some.TheoAnalysis", related_name="performances")
+
+analyses = TheoAnalysis.objects.all()
+
+for a in analyses:
+    for p in a.performances.all():
+        pass
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn access_using_relation_detected() {
+        let source = r#"
+class TheoAnalysis(Model):
+    name = models.CharField(max_length=20)
+
+class Performance(Model):
+    analysis = models.ManyToManyField("some.TheoAnalysis", related_name="performances")
+    pattern = models.ForeignKey(Pattern)
+
+class Pattern(Model):
+    name = models.CharField(max_length=20)
+
+a = TheoAnalysis.objects.get(id=1)
+performances = a.performances
+
+for p in performances:
+    print(p.pattern)
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn construct_with_direct_relation_detected() {
+        let source = r#"
+class TheoAnalysis(Model):
+    name = models.CharField(max_length=20)
+
+class Performance(Model):
+    analysis = models.ManyToManyField("some.TheoAnalysis", related_name="performances")
+    pattern = models.ForeignKey(Pattern)
+
+class Pattern(Model):
+    name = models.CharField(max_length=20)
+
+a = TheoAnalysis.objects.get(id=1).performances
+
+for p in performances:
+    print(p.pattern)
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn access_using_chained_detected() {
+        let source = r#"
+class TheoAnalysis(Model):
+    pattern = models.ForeignKey("app.Pattern")
+
+class Performance(Model):
+    analysis = models.ForeignKey("some.TheoAnalysis")
+
+class Pattern(Model):
+    name = models.CharField(max_length=20)
+
+
+performances = Performance.objects.select_related("analysis").all()
+
+for p in performances:
+    # analysis is ok
+    # pattern is N+1
+    print(p.analysis.pattern)
 "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
