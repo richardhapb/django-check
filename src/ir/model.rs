@@ -88,15 +88,37 @@ impl ModelGraph {
         // Reverse: related_names from models pointing to this one
         for m in self.dependents(model_name) {
             for r in &m.relations {
-                if r.target_model == model_name {
-                    if let Some(related_name) = &r.related_name {
-                        result.push(related_name.as_str());
-                    }
+                if r.target_model == model_name
+                    && let Some(related_name) = &r.related_name
+                {
+                    result.push(related_name.as_str());
                 }
             }
         }
 
         result
+    }
+
+    pub fn get_relation(&self, model_name: &str, relation_field: &str) -> Option<&str> {
+        // Forward: fields on this model pointing to others
+        if let Some(model) = self.models.get(model_name) {
+            for r in &model.relations {
+                if r.field_name == relation_field {
+                    return Some(r.target_model.as_str());
+                }
+            }
+        }
+
+        // Reverse: related_names from models pointing to this one
+        for m in self.dependents(model_name) {
+            for r in &m.relations {
+                if r.target_model == model_name {
+                    return Some(m.name.as_str());
+                }
+            }
+        }
+
+        None
     }
 
     /// Get all models that depend on the given model (reverse dependencies)

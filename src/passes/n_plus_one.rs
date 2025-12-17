@@ -121,9 +121,9 @@ impl<'a> NPlusOnePass<'a> {
                     if let Some(name) = attr.value.as_name_expr()
                         && let Some(kind) = self.lookup(&name.id)
                     {
-                        // This matches <myinstance.related_models> access trough a model instance
+                        // This matches <myinstance.related_model> access trough a model instance
                         //        name-> ^^^^^^^^^^ ^^^^^^^^^^^^^^ <- related_model
-                        // where name=myinstance and attr_name=related_models
+                        // where name=myinstance and attr_name=related_model
 
                         match kind {
                             BindingKind::QuerySet(ctx) if let Some(ref model) = ctx.model => {
@@ -257,6 +257,63 @@ impl<'a> NPlusOnePass<'a> {
             ),
         )
     }
+
+    fn extract_attribute_chain(
+        &self,
+        attr: &ruff_python_ast::ExprAttribute,
+    ) -> (String, Vec<String>) {
+        let mut chain = vec![attr.attr.id.to_string()];
+        let mut current = attr.value.as_ref();
+
+        loop {
+            match current {
+                Expr::Attribute(attr) => {
+                    chain.push(attr.attr.id.to_string());
+                    current = attr.value.as_ref();
+                }
+                Expr::Name(name) => {
+                    chain.reverse();
+                    return (name.id.to_string(), chain);
+                }
+                _ => return (String::new(), Vec::new()),
+            }
+        }
+    }
+
+    fn check_relation_chain(&self, ctx: &QuerySetContext, chain: &[String]) -> bool {
+        let Some(ref model_name) = ctx.model else {
+            return false;
+        };
+
+        let mut current_model = model_name.as_str();
+
+        for attr in chain.iter() {
+            let is_relation = self
+                .model_graph
+                .get_model_relations(current_model)
+                .iter()
+                .any(|r| *r == attr);
+
+            let should_warn = match &ctx.state {
+                QuerySetState::Unsafe => is_relation,
+                QuerySetState::Safe(method) => {
+                    is_relation && !method.prefetched_relations.iter().any(|a| a == attr)
+                }
+            };
+
+            if should_warn {
+                return true;
+            }
+
+            let Some(new_current_model) = self.model_graph.get_relation(current_model, attr) else {
+                return false;
+            };
+
+            current_model = new_current_model;
+        }
+
+        false
+    }
 }
 
 impl<'a> Pass<'a> for NPlusOnePass<'a> {
@@ -317,36 +374,26 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
-        if let Expr::Attribute(attr) = expr
-            && let Expr::Name(name) = attr.value.as_ref()
-        {
-            let attr_name = attr.attr.id.as_str();
+        if let Expr::Attribute(attr) = expr {
+            let (base_name, attr_chain) = self.extract_attribute_chain(attr);
 
             for ctx in &self.active_loops {
-                if name.id.as_str() != ctx.loop_var {
+                if base_name != ctx.loop_var {
                     continue;
                 }
 
-                let is_relation = ctx.queryset_context.model.as_ref().is_some_and(|m| {
-                    self.model_graph
-                        .get_model_relations(m.as_str())
-                        .iter()
-                        .any(|r| *r == attr_name)
-                });
+                let is_n_plus_one = self.check_relation_chain(&ctx.queryset_context, &attr_chain);
 
-                let should_warn = match &ctx.queryset_context.state {
-                    QuerySetState::Unsafe => is_relation,
-                    QuerySetState::Safe(method) => {
-                        is_relation && !method.prefetched_relations.iter().any(|a| a == attr_name)
-                    }
-                };
-                if should_warn {
-                    self.diagnostics
-                        .push(self.make_diagnostic(expr, &ctx.loop_var, attr_name));
+                if is_n_plus_one {
+                    self.diagnostics.push(self.make_diagnostic(
+                        expr,
+                        &ctx.loop_var,
+                        &attr_chain.join("."),
+                    ));
                 }
             }
+            return;
         }
-
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
 }
@@ -380,6 +427,23 @@ for item in qs:
 "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
+        assert!(diags[0].message.contains("related_field"));
+    }
+
+    #[test]
+    fn detect_unsafe_with_two_statements() {
+        // Exists a relation to App
+        let source = r#"
+class User(Model):
+    related_field = models.ForeignKey("some.App")
+
+qs = User.objects.filter(active=True)
+for item in qs:
+    print(item.related_field)
+    print(item.related_field)
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 2);
         assert!(diags[0].message.contains("related_field"));
     }
 
@@ -501,7 +565,7 @@ class Performance(Model):
 class Pattern(Model):
     name = models.CharField(max_length=20)
 
-a = TheoAnalysis.objects.get(id=1).performances
+performances = TheoAnalysis.objects.get(id=1).performances
 
 for p in performances:
     print(p.pattern)
