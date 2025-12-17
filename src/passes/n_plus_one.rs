@@ -93,146 +93,126 @@ impl<'a> NPlusOnePass<'a> {
     }
 
     fn classify_expr(&self, expr: &'a Expr) -> BindingKind {
-        self.classify_expr_inner(expr, &mut Vec::new())
-    }
+        let mut safe_methods = Vec::new();
+        let mut curr_expr = expr;
+        let mut model = None;
 
-    fn classify_expr_inner(&self, expr: &'a Expr, chain: &mut Vec<&'a Expr>) -> BindingKind {
-        match expr {
-            Expr::Call(call) => {
-                chain.push(expr);
-                self.classify_expr_inner(&call.func, chain)
-            }
-            Expr::Attribute(attr) => match attr.attr.id.as_str() {
-                "objects" => {
-                    let method = self.get_safe_method(chain);
+        loop {
+            match curr_expr {
+                Expr::Call(call) => {
+                    if let Some(safe_method) = self.get_safe_method(&call) {
+                        safe_methods.push(safe_method);
+                    }
 
-                    let model = if let Expr::Name(name) = attr.value.as_ref() {
-                        self.model_graph.get(&name.id).map(|m| m.name.clone())
-                    } else {
-                        None
-                    };
-                    let state = match method {
-                        Some(m) => QuerySetState::Safe(m),
-                        None => QuerySetState::Unsafe,
-                    };
-                    BindingKind::QuerySet(QuerySetContext { state, model })
+                    curr_expr = &call.func;
                 }
-                attr_name => {
-                    if let Some(name) = attr.value.as_name_expr()
-                        && let Some(kind) = self.lookup(&name.id)
-                    {
-                        // This matches <myinstance.related_model> access trough a model instance
-                        //        name-> ^^^^^^^^^^ ^^^^^^^^^^^^^^ <- related_model
-                        // where name=myinstance and attr_name=related_model
+                Expr::Attribute(attr) => {
+                    curr_expr = &attr.value;
+                    if model.is_some() {
+                        continue; // Already captured
+                    }
+                    let (base, _) = self.extract_attribute_chain(attr);
+                    model = self.model_graph.get(&base);
 
-                        match kind {
-                            BindingKind::QuerySet(ctx) if let Some(ref model) = ctx.model => {
-                                if self
-                                    .model_graph
-                                    .get_model_relations(model.as_str())
-                                    .iter()
-                                    .any(|&r| r == attr_name)
-                                {
-                                    let is_safe = match &ctx.state {
-                                        QuerySetState::Safe(safe_method) => safe_method
-                                            .prefetched_relations
-                                            .iter()
-                                            .any(|r| r.as_str() == attr_name),
-                                        QuerySetState::Unsafe => false,
-                                    };
-
-                                    let safe_method = self.get_safe_method(chain);
-
-                                    if let Some(safe_method) = safe_method
-                                        && is_safe
+                    if !model.is_some() {
+                        if let Some(captured) = self.lookup(&base) {
+                            match captured {
+                                BindingKind::QuerySet(ctx) => {
+                                    if let Some(related_model) = ctx
+                                        .model
+                                        .as_ref()
+                                        .and_then(|m| self.model_graph.get(m.as_str()))
                                     {
-                                        let ctx = QuerySetContext {
-                                            state: QuerySetState::Safe(safe_method),
-                                            model: Some(model.clone()),
-                                        };
-                                        BindingKind::QuerySet(ctx)
-                                    } else {
-                                        let model =
-                                            self.model_graph.models().into_iter().find(|m| {
-                                                m.relations.iter().any(|r| {
+                                        model = self
+                                            .model_graph
+                                            .dependents(&related_model.name)
+                                            .into_iter()
+                                            .find(|rm| {
+                                                rm.relations.iter().any(|r| {
                                                     r.related_name
                                                         .as_ref()
-                                                        .map(|rn| rn == attr_name)
-                                                        .is_some()
+                                                        .is_some_and(|r| r == attr.attr.id.as_str())
                                                 })
                                             });
-
-                                        let ctx = QuerySetContext {
-                                            state: QuerySetState::Unsafe,
-                                            model: model.map(|m| m.name.clone()),
-                                        };
-
-                                        BindingKind::QuerySet(ctx)
                                     }
-                                } else {
-                                    BindingKind::Unknown
                                 }
+                                BindingKind::Unknown => {}
                             }
-                            kind => kind.clone(),
                         }
-                    } else {
-                        self.classify_expr_inner(&attr.value, chain)
                     }
                 }
-            },
-            Expr::Name(name) => {
-                if let Some(kind) = self.lookup(name.id.as_str()) {
-                    match kind {
-                        BindingKind::QuerySet(ctx)
-                            if let Some(safe_method) = self.get_safe_method(chain) =>
-                        {
-                            BindingKind::QuerySet(QuerySetContext {
-                                state: QuerySetState::Safe(safe_method),
-                                model: ctx.model.clone(),
-                            })
-                        }
-                        _ => kind.clone(),
+                Expr::Name(name) => {
+                    if let Some(kind) = self.lookup(name.id.as_str()) {
+                        match kind {
+                            BindingKind::QuerySet(ctx) => {
+                                let state = match ctx.state {
+                                    QuerySetState::Safe(_) => {
+                                        return BindingKind::QuerySet(QuerySetContext {
+                                            state: QuerySetState::Safe(safe_methods),
+                                            model: ctx.model.clone(),
+                                        });
+                                    }
+                                    QuerySetState::Unsafe => QuerySetState::Unsafe,
+                                };
+                                return BindingKind::QuerySet(QuerySetContext {
+                                    state,
+                                    model: model.map(|m| m.name.clone()),
+                                });
+                            }
+                            BindingKind::Unknown => {}
+                        };
                     }
-                } else {
-                    BindingKind::Unknown
+                    break;
                 }
+                _ => break,
             }
-            _ => BindingKind::Unknown,
         }
+
+        let Some(model_instance) = model else {
+            return BindingKind::Unknown;
+        };
+
+        let state = if safe_methods.is_empty() {
+            QuerySetState::Unsafe
+        } else {
+            QuerySetState::Safe(safe_methods)
+        };
+
+        return BindingKind::QuerySet(QuerySetContext {
+            state,
+            model: Some(model_instance.name.clone()),
+        });
     }
 
-    fn get_safe_method(&self, chain: &[&Expr]) -> Option<SafeMethod> {
+    fn get_safe_method(&self, call: &ruff_python_ast::ExprCall) -> Option<SafeMethod> {
         const SAFE_QS_METHODS: [&str; 2] = ["select_related", "prefetch_related"];
         const SAFE_NO_QS_METHODS: [&str; 3] = ["values", "values_list", "iterator"];
 
         let mut safe_method = None;
 
-        for expr in chain {
-            let call = expr.as_call_expr()?;
-            let attr = call.func.as_attribute_expr()?;
-            let name = attr.attr.id.as_str();
+        let attr = call.func.as_attribute_expr()?;
+        let name = attr.attr.id.as_str();
 
-            if SAFE_NO_QS_METHODS.contains(&name) {
-                return Some(SafeMethod {
-                    name: name.to_string(),
-                    prefetched_relations: Vec::new(),
-                });
-            }
+        if SAFE_NO_QS_METHODS.contains(&name) {
+            return Some(SafeMethod {
+                name: name.to_string(),
+                prefetched_relations: Vec::new(),
+            });
+        }
 
-            if SAFE_QS_METHODS.contains(&name) {
-                let fields: Vec<String> = call
-                    .arguments
-                    .args
-                    .iter()
-                    .filter_map(|a| a.as_string_literal_expr())
-                    .map(|s| s.value.to_string())
-                    .collect();
+        if SAFE_QS_METHODS.contains(&name) {
+            let fields: Vec<String> = call
+                .arguments
+                .args
+                .iter()
+                .filter_map(|a| a.as_string_literal_expr())
+                .map(|s| s.value.to_string())
+                .collect();
 
-                safe_method = Some(SafeMethod {
-                    name: name.to_string(),
-                    prefetched_relations: parse_relation_fields(&fields),
-                });
-            }
+            safe_method = Some(SafeMethod {
+                name: name.to_string(),
+                prefetched_relations: parse_relation_fields(&fields),
+            });
         }
 
         safe_method
@@ -288,16 +268,15 @@ impl<'a> NPlusOnePass<'a> {
         let mut current_model = model_name.as_str();
 
         for attr in chain.iter() {
-            let is_relation = self
-                .model_graph
-                .get_model_relations(current_model)
-                .iter()
-                .any(|r| *r == attr);
+            let is_relation = self.model_graph.is_relation(current_model, attr);
 
             let should_warn = match &ctx.state {
                 QuerySetState::Unsafe => is_relation,
-                QuerySetState::Safe(method) => {
-                    is_relation && !method.prefetched_relations.iter().any(|a| a == attr)
+                QuerySetState::Safe(methods) => {
+                    is_relation
+                        && !methods
+                            .iter()
+                            .any(|p| p.prefetched_relations.iter().any(|a| a == attr))
                 }
             };
 

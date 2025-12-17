@@ -75,6 +75,12 @@ impl ModelGraph {
         self.models.len()
     }
 
+    pub fn is_relation(&self, model_name: &str, related_name: &str) -> bool {
+        self.get_model_relations(model_name)
+            .iter()
+            .any(|r| *r == related_name)
+    }
+
     pub fn get_model_relations(&self, model_name: &str) -> Vec<&str> {
         let mut result = Vec::new();
 

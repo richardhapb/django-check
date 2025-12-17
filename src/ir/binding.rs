@@ -15,7 +15,7 @@ pub struct SafeMethod {
 #[derive(Debug, Clone)]
 pub enum QuerySetState {
     /// Queryset has select_related/prefetch_related with tracked fields
-    Safe(SafeMethod),
+    Safe(Vec<SafeMethod>),
     /// Queryset has no prefetching - any relation access is potentially N+1
     Unsafe,
 }
