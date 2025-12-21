@@ -111,37 +111,67 @@ impl<'a> NPlusOnePass<'a> {
                     if model.is_some() {
                         continue; // Already captured
                     }
-                    let (base, _) = self.extract_attribute_chain(attr);
+                    let (base, chain) = self.extract_attribute_chain(attr);
                     model = self.model_graph.get(&base);
 
-                    if !model.is_some() {
-                        if let Some(captured) = self.lookup(&base) {
-                            match captured {
-                                BindingKind::QuerySet(ctx) => {
-                                    if let Some(related_model) = ctx
-                                        .model
-                                        .as_ref()
-                                        .and_then(|m| self.model_graph.get(m.as_str()))
-                                    {
-                                        model = self
-                                            .model_graph
-                                            .dependents(&related_model.name)
-                                            .into_iter()
-                                            .find(|rm| {
-                                                rm.relations.iter().any(|r| {
-                                                    r.related_name
-                                                        .as_ref()
-                                                        .is_some_and(|r| r == attr.attr.id.as_str())
-                                                })
-                                            });
-                                    }
-                                }
-                                BindingKind::Unknown => {}
+                    if model.is_some() {
+                        // Check for chained access
+                        for expr in chain.iter() {
+                            if self.model_graph.is_relation(&base, expr) {
+                                model = self
+                                    .model_graph
+                                    .get_relation(&base, &expr)
+                                    .and_then(|m| self.model_graph.get(m));
+                                break;
                             }
+                        }
+                    }
+
+                    if model.is_none()
+                        && let Some(captured) = self.lookup(&base)
+                    {
+                        match captured {
+                            BindingKind::QuerySet(ctx) => {
+                                if let Some(related_model) = ctx
+                                    .model
+                                    .as_ref()
+                                    .and_then(|m| self.model_graph.get(m.as_str()))
+                                {
+                                    for expr in chain.iter() {
+                                        if self.model_graph.is_relation(&related_model.name, expr) {
+                                            model = self
+                                                .model_graph
+                                                .get_relation(&related_model.name, &expr)
+                                                .and_then(|m| self.model_graph.get(m));
+                                            break;
+                                        }
+                                    }
+
+                                    if model.is_some() {
+                                        continue;
+                                    }
+
+                                    model = self
+                                        .model_graph
+                                        .dependents(&related_model.name)
+                                        .into_iter()
+                                        .find(|rm| {
+                                            rm.relations.iter().any(|r| {
+                                                r.related_name
+                                                    .as_ref()
+                                                    .is_some_and(|r| r == attr.attr.id.as_str())
+                                            })
+                                        });
+                                }
+                            }
+                            BindingKind::Unknown => {}
                         }
                     }
                 }
                 Expr::Name(name) => {
+                    if model.is_some() {
+                        break; // Already captured
+                    }
                     if let Some(kind) = self.lookup(name.id.as_str()) {
                         match kind {
                             BindingKind::QuerySet(ctx) => {
@@ -238,6 +268,13 @@ impl<'a> NPlusOnePass<'a> {
         )
     }
 
+    /// Extract the attribute chain from a complete sentence
+    ///
+    /// Args
+    ///     attr: The attribute where begin to backward for capturing the chain
+    ///
+    /// Returns
+    ///     tuple with the base element of the sentence and all the posterior expressions
     fn extract_attribute_chain(
         &self,
         attr: &ruff_python_ast::ExprAttribute,
@@ -250,6 +287,9 @@ impl<'a> NPlusOnePass<'a> {
                 Expr::Attribute(attr) => {
                     chain.push(attr.attr.id.to_string());
                     current = attr.value.as_ref();
+                }
+                Expr::Call(call) => {
+                    current = call.func.as_ref();
                 }
                 Expr::Name(name) => {
                     chain.reverse();
@@ -575,5 +615,30 @@ for p in performances:
 "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn related_access() {
+        let source = r#"
+class TheoAnalysis(models.Model):
+    tier = models.CharField(max_length=11, choices=Tiers.choices)
+
+class Tier1(models.Model):
+    theo_analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
+
+class Tier1RelativePerformance(models.Model):
+    tier1 = models.ForeignKey("theo.Tier1", on_delete=models.CASCADE, related_name="relative_performances")
+
+theo_analysis = TheoAnalysis.objects.filter(id=analysis_id, tier=Tiers.TIER1).first()
+tier1 = theo_analysis.tier1s.filter(
+    failed_reasons__isnull=True).select_related('ticker').prefetch_related('relative_performances')
+
+for t in tier1:
+    for rp in t.relative_performances.all():
+        pass
+        "#;
+
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
     }
 }
