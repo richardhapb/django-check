@@ -103,11 +103,11 @@ impl ModelGraph {
         result
     }
 
-    pub fn get_relation(&self, model_name: &str, relation_field: &str) -> Option<&str> {
+    pub fn get_relation(&self, model_name: &str, related_name: &str) -> Option<&str> {
         // Forward: fields on this model pointing to others
         if let Some(model) = self.models.get(model_name) {
             for r in &model.relations {
-                if r.field_name == relation_field {
+                if r.field_name == related_name {
                     return Some(r.target_model.as_str());
                 }
             }
@@ -116,7 +116,9 @@ impl ModelGraph {
         // Reverse: related_names from models pointing to this one
         for m in self.dependents(model_name) {
             for r in &m.relations {
-                if r.target_model == model_name {
+                if r.target_model == model_name
+                    && r.related_name.as_ref().is_some_and(|rn| rn == related_name)
+                {
                     return Some(m.name.as_str());
                 }
             }

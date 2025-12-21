@@ -1,0 +1,10 @@
+[package]
+name = "pydj"
+version = "0.1.0"
+rust-version = { workspace = true }
+license = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+pydj_semantic = { workspace = true }

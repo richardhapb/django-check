@@ -307,8 +307,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "pyesis"
+name = "pydj"
 version = "0.1.0"
+dependencies = [
+ "pydj_semantic",
+]
+
+[[package]]
+name = "pydj-server"
+version = "0.1.0"
+
+[[package]]
+name = "pydj_semantic"
+version = "0.0.0"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
