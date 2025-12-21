@@ -100,7 +100,7 @@ impl<'a> NPlusOnePass<'a> {
         loop {
             match curr_expr {
                 Expr::Call(call) => {
-                    if let Some(safe_method) = self.get_safe_method(&call) {
+                    if let Some(safe_method) = self.get_safe_method(call) {
                         safe_methods.push(safe_method);
                     }
 
@@ -115,12 +115,13 @@ impl<'a> NPlusOnePass<'a> {
                     model = self.model_graph.get(&base);
 
                     if model.is_some() {
-                        // Check for chained access
+                        // Check for chained access if a model name
+                        // was detected
                         for expr in chain.iter() {
                             if self.model_graph.is_relation(&base, expr) {
                                 model = self
                                     .model_graph
-                                    .get_relation(&base, &expr)
+                                    .get_relation(&base, expr)
                                     .and_then(|m| self.model_graph.get(m));
                                 break;
                             }
@@ -137,31 +138,27 @@ impl<'a> NPlusOnePass<'a> {
                                     .as_ref()
                                     .and_then(|m| self.model_graph.get(m.as_str()))
                                 {
+                                    // Check for chained access if a model variable
+                                    // was detected
                                     for expr in chain.iter() {
                                         if self.model_graph.is_relation(&related_model.name, expr) {
                                             model = self
                                                 .model_graph
-                                                .get_relation(&related_model.name, &expr)
+                                                .get_relation(&related_model.name, expr)
                                                 .and_then(|m| self.model_graph.get(m));
                                             break;
                                         }
                                     }
 
+                                    // Skip if the model was found in the last step
                                     if model.is_some() {
                                         continue;
                                     }
 
                                     model = self
                                         .model_graph
-                                        .dependents(&related_model.name)
-                                        .into_iter()
-                                        .find(|rm| {
-                                            rm.relations.iter().any(|r| {
-                                                r.related_name
-                                                    .as_ref()
-                                                    .is_some_and(|r| r == attr.attr.id.as_str())
-                                            })
-                                        });
+                                        .get_relation(&base, attr.attr.id.as_str())
+                                        .and_then(|m| self.model_graph.get(m));
                                 }
                             }
                             BindingKind::Unknown => {}
@@ -169,10 +166,9 @@ impl<'a> NPlusOnePass<'a> {
                     }
                 }
                 Expr::Name(name) => {
-                    if model.is_some() {
-                        break; // Already captured
-                    }
-                    if let Some(kind) = self.lookup(name.id.as_str()) {
+                    if model.is_none()
+                        && let Some(kind) = self.lookup(name.id.as_str())
+                    {
                         match kind {
                             BindingKind::QuerySet(ctx) => {
                                 let state = match ctx.state {
@@ -208,10 +204,10 @@ impl<'a> NPlusOnePass<'a> {
             QuerySetState::Safe(safe_methods)
         };
 
-        return BindingKind::QuerySet(QuerySetContext {
+        BindingKind::QuerySet(QuerySetContext {
             state,
             model: Some(model_instance.name.clone()),
-        });
+        })
     }
 
     fn get_safe_method(&self, call: &ruff_python_ast::ExprCall) -> Option<SafeMethod> {
@@ -618,7 +614,7 @@ for p in performances:
     }
 
     #[test]
-    fn related_access() {
+    fn second_level_related_access() {
         let source = r#"
 class TheoAnalysis(models.Model):
     tier = models.CharField(max_length=11, choices=Tiers.choices)

@@ -92,7 +92,7 @@ impl<'a> ModelGraphPass<'a> {
             Expr::StringLiteral(s) => {
                 let value = s.value.to_string();
                 // Handle 'app.Model' format - take the model name
-                Some(value.split('.').last().unwrap_or(&value).to_string())
+                Some(value.split('.').next_back().unwrap_or(&value).to_string())
             }
             // Direct reference: ForeignKey(ModelName)
             Expr::Name(name) => Some(name.id.to_string()),

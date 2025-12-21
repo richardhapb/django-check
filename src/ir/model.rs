@@ -76,9 +76,7 @@ impl ModelGraph {
     }
 
     pub fn is_relation(&self, model_name: &str, related_name: &str) -> bool {
-        self.get_model_relations(model_name)
-            .iter()
-            .any(|r| *r == related_name)
+        self.get_model_relations(model_name).contains(&related_name)
     }
 
     pub fn get_model_relations(&self, model_name: &str) -> Vec<&str> {
