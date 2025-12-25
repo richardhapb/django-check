@@ -30,26 +30,16 @@ impl Parser {
     pub fn analyze_n_plus_one(
         &self,
         dir: &Path,
+        model_graph: &ModelGraph,
     ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
         let mut all_diagnostics = Vec::new();
 
-        let mut global_graph = ModelGraph::new();
         for entry in Self::python_files(dir) {
             let source = fs::read_to_string(entry.path())?;
             let parsed = self.parse_module(&source)?;
             let filename = Self::relative_path(dir, entry.path());
 
-            let mut graph_pass = ModelGraphPass::new(&filename, &source);
-            let file_graph = graph_pass.run(parsed.syntax());
-            global_graph.merge(file_graph);
-        }
-
-        for entry in Self::python_files(dir) {
-            let source = fs::read_to_string(entry.path())?;
-            let parsed = self.parse_module(&source)?;
-            let filename = Self::relative_path(dir, entry.path());
-
-            let mut n1_pass = NPlusOnePass::new(&filename, &source, &global_graph);
+            let mut n1_pass = NPlusOnePass::new(&filename, &source, model_graph);
             let diagnostics = n1_pass.run(parsed.syntax());
             all_diagnostics.extend(diagnostics);
         }
@@ -78,8 +68,12 @@ impl Parser {
     }
 
     /// Run all analyses and print results (current behavior)
-    pub fn analyze_directory(&self, dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let diagnostics = self.analyze_n_plus_one(dir)?;
+    pub fn analyze_directory(
+        &self,
+        dir: &Path,
+        model_graph: &ModelGraph,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let diagnostics = self.analyze_n_plus_one(dir, model_graph)?;
 
         for diag in &diagnostics {
             println!("{}\n", diag);

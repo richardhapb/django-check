@@ -1,11 +1,30 @@
-use pydj_semantic::Parser;
-use std::env::home_dir;
+mod cli;
 
-fn main() {
-    let home = home_dir().unwrap();
+use pydj_semantic::Parser;
+use pydj_server::serve;
+use std::env::current_dir;
+
+use clap::Parser as ClapParser;
+use cli::{Cli, Cmd};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = current_dir().expect("should get the cwd");
     let parser = Parser::new();
 
-    if let Err(e) = parser.analyze_directory(&home.join("dev/agora_hedge/main/app")) {
-        eprintln!("Error: {}", e);
+    let cli = Cli::parse();
+    let model_graph = parser.extract_model_graph(&cwd)?;
+
+    match cli.cmd {
+        Cmd::Check => {
+            if let Err(e) = parser.analyze_directory(&cwd, &model_graph) {
+                eprintln!("Error: {}", e);
+            }
+        }
+        Cmd::Server => {
+            serve().await;
+        }
     }
+
+    Ok(())
 }

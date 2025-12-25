@@ -1,5 +1,5 @@
 [package]
-name = "pydj-server"
+name = "pydj_server"
 version = "0.1.0"
 rust-version = { workspace = true }
 license = { workspace = true }
@@ -7,3 +7,5 @@ authors = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
+tower-lsp = "0.20.0"
+tokio = {workspace = true}

@@ -7,4 +7,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
 pydj_semantic = { workspace = true }
+pydj_server = { workspace = true }
+tokio = { workspace = true }
