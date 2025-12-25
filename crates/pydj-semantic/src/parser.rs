@@ -12,6 +12,7 @@ use crate::passes::Pass;
 use crate::passes::model_graph::ModelGraphPass;
 use crate::passes::n_plus_one::NPlusOnePass;
 
+#[derive(Debug, Clone)]
 pub struct Parser;
 
 impl Parser {
@@ -26,22 +27,39 @@ impl Parser {
         Ok(parse_module(source)?)
     }
 
-    /// Run N+1 detection on a directory
+    fn analyze_n_plus_one_file(
+        &self,
+        file: &Path,
+        model_graph: &ModelGraph,
+    ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+        let source = fs::read_to_string(file)?;
+        let parsed = self.parse_module(&source)?;
+
+        let mut n1_pass = NPlusOnePass::new(
+            file.file_name().unwrap().to_str().unwrap(),
+            &source,
+            model_graph,
+        );
+        Ok(n1_pass.run(parsed.syntax()))
+    }
+
+    /// Run N+1 detection on a file or a directory, this function figure out
+    /// if the path contains a file or a directory and perform the analysis
+    /// in consequence.
     pub fn analyze_n_plus_one(
         &self,
-        dir: &Path,
+        path: &Path,
         model_graph: &ModelGraph,
     ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
         let mut all_diagnostics = Vec::new();
 
-        for entry in Self::python_files(dir) {
-            let source = fs::read_to_string(entry.path())?;
-            let parsed = self.parse_module(&source)?;
-            let filename = Self::relative_path(dir, entry.path());
-
-            let mut n1_pass = NPlusOnePass::new(&filename, &source, model_graph);
-            let diagnostics = n1_pass.run(parsed.syntax());
-            all_diagnostics.extend(diagnostics);
+        if path.is_dir() {
+            for entry in Self::python_files(path) {
+                let diagnostics = self.analyze_n_plus_one_file(entry.path(), model_graph)?;
+                all_diagnostics.extend(diagnostics);
+            }
+        } else if path.is_file() {
+            all_diagnostics = self.analyze_n_plus_one_file(path, model_graph)?;
         }
 
         Ok(all_diagnostics)
@@ -81,6 +99,15 @@ impl Parser {
 
         println!("\nTotal N+1 warnings: {}", diagnostics.len());
         Ok(())
+    }
+
+    /// Run all analyses in a single file and return diagnostics
+    pub fn analyze_file(
+        &self,
+        file: &Path,
+        model_graph: &ModelGraph,
+    ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+        Ok(self.analyze_n_plus_one_file(file, model_graph)?)
     }
 
     fn python_files(dir: &Path) -> impl Iterator<Item = walkdir::DirEntry> {

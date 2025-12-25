@@ -49,7 +49,7 @@ impl ModelDef {
 }
 
 /// Dependency graph of Django models
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ModelGraph {
     models: HashMap<String, ModelDef>,
 }

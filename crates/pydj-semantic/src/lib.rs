@@ -5,4 +5,5 @@ mod ir;
 mod parser;
 mod passes;
 
-pub use crate::parser::Parser;
+pub use parser::Parser;
+pub use ir::model::ModelGraph;

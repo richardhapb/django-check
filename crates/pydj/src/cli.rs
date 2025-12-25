@@ -11,4 +11,3 @@ pub enum Cmd {
     Server,
     Check,
 }
-
