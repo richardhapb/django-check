@@ -5,5 +5,6 @@ mod ir;
 mod parser;
 mod passes;
 
-pub use parser::Parser;
+pub use diagnostic::NPlusOneDiagnostic;
 pub use ir::model::ModelGraph;
+pub use parser::Parser;

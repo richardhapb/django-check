@@ -9,7 +9,7 @@ use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
 
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::NPlusOneDiagnostic;
 use crate::ir::binding::{
     BindingKind, QuerySetContext, QuerySetState, SafeMethod, parse_relation_fields,
 };
@@ -43,7 +43,7 @@ pub struct NPlusOnePass<'a> {
     scopes: Vec<ScopeState>,
     model_graph: &'a ModelGraph,
     active_loops: Vec<LoopContext>,
-    diagnostics: Vec<Diagnostic>,
+    diagnostics: Vec<NPlusOneDiagnostic>,
 }
 
 impl<'a> NPlusOnePass<'a> {
@@ -244,14 +244,14 @@ impl<'a> NPlusOnePass<'a> {
         safe_method
     }
 
-    fn make_diagnostic(&self, expr: &Expr, loop_var: &str, attr_name: &str) -> Diagnostic {
+    fn make_diagnostic(&self, expr: &Expr, loop_var: &str, attr_name: &str) -> NPlusOneDiagnostic {
         let range = expr.range();
         let start = range.start().to_usize();
 
         let line = self.source[..start].chars().filter(|&c| c == '\n').count() + 1;
         let col = start - self.source[..start].rfind('\n').map(|p| p + 1).unwrap_or(0) + 1;
 
-        Diagnostic::new(
+        NPlusOneDiagnostic::new(
             self.filename,
             line,
             col,
@@ -332,7 +332,7 @@ impl<'a> NPlusOnePass<'a> {
 }
 
 impl<'a> Pass<'a> for NPlusOnePass<'a> {
-    type Output = Vec<Diagnostic>;
+    type Output = Vec<NPlusOneDiagnostic>;
 
     fn run(&mut self, module: &'a ModModule) -> Self::Output {
         for stmt in &module.body {
@@ -420,7 +420,7 @@ mod tests {
     use super::*;
     use ruff_python_parser::parse_module;
 
-    fn run_pass(source: &str) -> Vec<Diagnostic> {
+    fn run_pass(source: &str) -> Vec<NPlusOneDiagnostic> {
         let parsed = parse_module(source).expect("should parse");
         let mut graph_pass = ModelGraphPass::new("test.py", source);
         let graph = graph_pass.run(parsed.syntax());

@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use pydj_semantic::{ModelGraph, Parser};
 
@@ -10,11 +11,22 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use tracing::{debug, info, trace};
 use tracing_subscriber::{self, EnvFilter};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Backend {
+    #[allow(dead_code)]
+    cwd: PathBuf,
+    current_source: Arc<Mutex<String>>,
     client: Client,
     parser: Parser,
-    model_graph: ModelGraph,
+    model_graph: Arc<Mutex<ModelGraph>>,
+}
+
+impl Backend {
+    #[allow(dead_code)]
+    fn reanalyze_graph(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        *self.model_graph.lock().unwrap() = self.parser.extract_model_graph(&self.cwd)?;
+        Ok(())
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -56,26 +68,48 @@ impl LanguageServer for Backend {
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         debug!("method: textDocument/didOpen");
-        trace!(?params);
-        let uri = params
-            .text_document
-            .uri
-            .as_str()
-            .strip_prefix("file://")
-            .unwrap();
-        let path = Path::new(uri);
+        *self.current_source.lock().unwrap() = params.text_document.text;
+    }
 
-        trace!(?uri);
-
-        let diagnostics = self.parser.analyze_file(&path, &self.model_graph);
-        debug!(?diagnostics);
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        debug!("method: textDocument/didChange");
+        *self.current_source.lock().unwrap() = params.content_changes.iter().next().unwrap().text.clone();
     }
 
     async fn diagnostic(
         &self,
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
-        todo!()
+        let file_name = params
+            .text_document
+            .uri
+            .as_str()
+            .strip_prefix("file://")
+            .unwrap()
+            .split("/")
+            .last()
+            .unwrap();
+
+        trace!(?file_name);
+
+        let diagnostics = self
+            .parser
+            .analyze_source(
+                &*self.current_source.lock().unwrap(),
+                file_name,
+                &*self.model_graph.lock().unwrap(),
+            )
+            .unwrap();
+        debug!(?diagnostics);
+        Ok(DocumentDiagnosticReportResult::Report(
+            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: params.identifier,
+                    items: diagnostics.into_iter().map(|d| d.into()).collect(),
+                },
+            }),
+        ))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -107,9 +141,11 @@ pub async fn serve(cwd: &Path) {
     let stdout = tokio::io::stdout();
 
     let (service, socket) = LspService::new(|client| Backend {
+        cwd: cwd.to_path_buf(),
         client,
         parser,
-        model_graph,
+        model_graph: Arc::new(Mutex::new(model_graph)),
+        current_source: Arc::new(Mutex::new(String::new()))
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }

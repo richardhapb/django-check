@@ -804,6 +804,7 @@ dependencies = [
 name = "pydj_semantic"
 version = "0.0.0"
 dependencies = [
+ "lsp-types",
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",

@@ -6,7 +6,7 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::NPlusOneDiagnostic;
 use crate::ir::model::ModelGraph;
 use crate::passes::Pass;
 use crate::passes::model_graph::ModelGraphPass;
@@ -31,16 +31,13 @@ impl Parser {
         &self,
         file: &Path,
         model_graph: &ModelGraph,
-    ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let source = fs::read_to_string(file)?;
-        let parsed = self.parse_module(&source)?;
-
-        let mut n1_pass = NPlusOnePass::new(
-            file.file_name().unwrap().to_str().unwrap(),
+        self.analyze_source(
             &source,
+            file.file_name().unwrap().to_str().unwrap(),
             model_graph,
-        );
-        Ok(n1_pass.run(parsed.syntax()))
+        )
     }
 
     /// Run N+1 detection on a file or a directory, this function figure out
@@ -50,7 +47,7 @@ impl Parser {
         &self,
         path: &Path,
         model_graph: &ModelGraph,
-    ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let mut all_diagnostics = Vec::new();
 
         if path.is_dir() {
@@ -106,8 +103,21 @@ impl Parser {
         &self,
         file: &Path,
         model_graph: &ModelGraph,
-    ) -> Result<Vec<Diagnostic>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         Ok(self.analyze_n_plus_one_file(file, model_graph)?)
+    }
+
+    /// Run all analyses in a source code and return diagnostics
+    pub fn analyze_source(
+        &self,
+        source: &str,
+        file_name: &str,
+        model_graph: &ModelGraph,
+    ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
+        let parsed = self.parse_module(source)?;
+
+        let mut n1_pass = NPlusOnePass::new(file_name, &source, model_graph);
+        Ok(n1_pass.run(parsed.syntax()))
     }
 
     fn python_files(dir: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
