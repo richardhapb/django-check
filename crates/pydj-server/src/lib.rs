@@ -73,33 +73,40 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         debug!("method: textDocument/didChange");
-        *self.current_source.lock().unwrap() = params.content_changes.iter().next().unwrap().text.clone();
+        match params.content_changes.iter().next() {
+            Some(cch) => *self.current_source.lock().unwrap() = cch.text.clone(),
+            None => {}
+        }
     }
 
     async fn diagnostic(
         &self,
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
-        let file_name = params
+        let mut diagnostics = Vec::new();
+        if let Some(file_name) = params
             .text_document
             .uri
             .as_str()
             .strip_prefix("file://")
-            .unwrap()
+            .unwrap_or(params.text_document.uri.as_str())
             .split("/")
             .last()
-            .unwrap();
+        {
+            trace!(?file_name);
 
-        trace!(?file_name);
-
-        let diagnostics = self
-            .parser
-            .analyze_source(
+            match self.parser.analyze_source(
                 &*self.current_source.lock().unwrap(),
                 file_name,
                 &*self.model_graph.lock().unwrap(),
-            )
-            .unwrap();
+            ) {
+                Ok(diags) => diagnostics = diags,
+                Err(e) => {
+                    trace!(e);
+                }
+            }
+        }
+
         debug!(?diagnostics);
         Ok(DocumentDiagnosticReportResult::Report(
             DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
@@ -145,7 +152,7 @@ pub async fn serve(cwd: &Path) {
         client,
         parser,
         model_graph: Arc::new(Mutex::new(model_graph)),
-        current_source: Arc::new(Mutex::new(String::new()))
+        current_source: Arc::new(Mutex::new(String::new())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
 }
