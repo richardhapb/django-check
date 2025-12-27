@@ -389,9 +389,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
                 self.pop_scope();
             }
-            _ => {
-                ruff_python_ast::visitor::walk_stmt(self, stmt);
-            }
+            _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
         }
     }
 
