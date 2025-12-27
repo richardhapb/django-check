@@ -8,9 +8,12 @@ use walkdir::WalkDir;
 
 use crate::diagnostic::NPlusOneDiagnostic;
 use crate::ir::model::ModelGraph;
-use crate::passes::Pass;
-use crate::passes::model_graph::ModelGraphPass;
-use crate::passes::n_plus_one::NPlusOnePass;
+use crate::passes::{
+    Pass,
+    functions::{QueryFunction, QueryFunctionPass},
+    model_graph::ModelGraphPass,
+    n_plus_one::NPlusOnePass,
+};
 
 #[derive(Debug, Clone)]
 pub struct Parser;
@@ -31,12 +34,14 @@ impl Parser {
         &self,
         file: &Path,
         model_graph: &ModelGraph,
+        functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let source = fs::read_to_string(file)?;
         self.analyze_source(
             &source,
             file.file_name().unwrap().to_str().unwrap(),
             model_graph,
+            functions,
         )
     }
 
@@ -47,16 +52,18 @@ impl Parser {
         &self,
         path: &Path,
         model_graph: &ModelGraph,
+        functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let mut all_diagnostics = Vec::new();
 
         if path.is_dir() {
             for entry in Self::python_files(path) {
-                let diagnostics = self.analyze_n_plus_one_file(entry.path(), model_graph)?;
+                let diagnostics =
+                    self.analyze_n_plus_one_file(entry.path(), model_graph, functions)?;
                 all_diagnostics.extend(diagnostics);
             }
         } else if path.is_file() {
-            all_diagnostics = self.analyze_n_plus_one_file(path, model_graph)?;
+            all_diagnostics = self.analyze_n_plus_one_file(path, model_graph, functions)?;
         }
 
         Ok(all_diagnostics)
@@ -82,13 +89,32 @@ impl Parser {
         Ok(combined_graph)
     }
 
+    pub fn extract_functions(
+        &self,
+        dir: &Path,
+    ) -> Result<Vec<QueryFunction>, Box<dyn std::error::Error>> {
+        let mut functions = Vec::new();
+        for entry in Self::python_files(dir) {
+            let source = fs::read_to_string(entry.path())?;
+            let parsed = self.parse_module(&source)?;
+            // let filename = Self::relative_path(dir, entry.path());
+
+            let mut pass = QueryFunctionPass::new();
+            let result = pass.run(parsed.syntax());
+            functions.extend(result);
+        }
+
+        Ok(functions)
+    }
+
     /// Run all analyses and print results (current behavior)
     pub fn analyze_directory(
         &self,
         dir: &Path,
         model_graph: &ModelGraph,
+        functions: &[QueryFunction],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let diagnostics = self.analyze_n_plus_one(dir, model_graph)?;
+        let diagnostics = self.analyze_n_plus_one(dir, model_graph, functions)?;
 
         for diag in &diagnostics {
             println!("{}\n", diag);
@@ -103,8 +129,9 @@ impl Parser {
         &self,
         file: &Path,
         model_graph: &ModelGraph,
+        functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
-        Ok(self.analyze_n_plus_one_file(file, model_graph)?)
+        Ok(self.analyze_n_plus_one_file(file, model_graph, functions)?)
     }
 
     /// Run all analyses in a source code and return diagnostics
@@ -113,10 +140,11 @@ impl Parser {
         source: &str,
         file_name: &str,
         model_graph: &ModelGraph,
+        functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let parsed = self.parse_module(source)?;
 
-        let mut n1_pass = NPlusOnePass::new(file_name, &source, model_graph);
+        let mut n1_pass = NPlusOnePass::new(file_name, &source, model_graph, functions);
         Ok(n1_pass.run(parsed.syntax()))
     }
 

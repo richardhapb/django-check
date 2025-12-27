@@ -13,11 +13,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parser = Parser::new();
 
     let cli = Cli::parse();
-    let model_graph = parser.extract_model_graph(&cwd)?;
 
     match cli.cmd {
         Cmd::Check => {
-            if let Err(e) = parser.analyze_directory(&cwd, &model_graph) {
+            let model_graph = parser.extract_model_graph(&cwd)?;
+            let functions = parser.extract_functions(&cwd)?;
+            if let Err(e) = parser.analyze_directory(&cwd, &model_graph, &functions) {
                 eprintln!("Error: {}", e);
             }
         }

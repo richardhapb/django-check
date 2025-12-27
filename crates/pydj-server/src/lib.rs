@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pydj_semantic::{ModelGraph, Parser};
+use pydj_semantic::{ModelGraph, Parser, QueryFunction};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -19,6 +19,7 @@ struct Backend {
     client: Client,
     parser: Parser,
     model_graph: Arc<Mutex<ModelGraph>>,
+    functions: Vec<QueryFunction>,
 }
 
 impl Backend {
@@ -99,6 +100,7 @@ impl LanguageServer for Backend {
                 &*self.current_source.lock().unwrap(),
                 file_name,
                 &*self.model_graph.lock().unwrap(),
+                &self.functions,
             ) {
                 Ok(diags) => diagnostics = diags,
                 Err(e) => {
@@ -120,6 +122,7 @@ impl LanguageServer for Backend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        info!("Shutting down the server");
         Ok(())
     }
 }
@@ -143,6 +146,7 @@ pub async fn serve(cwd: &Path) {
 
     let parser = Parser::new();
     let model_graph = parser.extract_model_graph(cwd).expect("parse model graph");
+    let functions = parser.extract_functions(cwd).expect("extract functions");
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -152,6 +156,7 @@ pub async fn serve(cwd: &Path) {
         client,
         parser,
         model_graph: Arc::new(Mutex::new(model_graph)),
+        functions,
         current_source: Arc::new(Mutex::new(String::new())),
     });
     Server::new(stdin, stdout, socket).serve(service).await;

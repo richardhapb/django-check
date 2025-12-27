@@ -1,5 +1,6 @@
 //! Analysis passes over Python AST.
 
+pub mod functions;
 pub mod model_graph;
 pub mod n_plus_one;
 

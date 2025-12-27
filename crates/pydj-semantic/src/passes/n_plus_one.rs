@@ -14,7 +14,7 @@ use crate::ir::binding::{
     BindingKind, QuerySetContext, QuerySetState, SafeMethod, parse_relation_fields,
 };
 use crate::ir::model::ModelGraph;
-use crate::passes::Pass;
+use crate::passes::{Pass, functions::QueryFunction};
 
 const DIAGNOSTIC_CODE: &str = "N+1";
 
@@ -43,11 +43,17 @@ pub struct NPlusOnePass<'a> {
     scopes: Vec<ScopeState>,
     model_graph: &'a ModelGraph,
     active_loops: Vec<LoopContext>,
+    functions: &'a [QueryFunction],
     diagnostics: Vec<NPlusOneDiagnostic>,
 }
 
 impl<'a> NPlusOnePass<'a> {
-    pub fn new(filename: &'a str, source: &'a str, model_graph: &'a ModelGraph) -> Self {
+    pub fn new(
+        filename: &'a str,
+        source: &'a str,
+        model_graph: &'a ModelGraph,
+        functions: &'a [QueryFunction],
+    ) -> Self {
         Self {
             filename,
             source,
@@ -55,6 +61,7 @@ impl<'a> NPlusOnePass<'a> {
             scopes: vec![ScopeState::new()],
             active_loops: Vec::new(),
             diagnostics: Vec::new(),
+            functions,
         }
     }
 
@@ -424,8 +431,9 @@ mod tests {
         let parsed = parse_module(source).expect("should parse");
         let mut graph_pass = ModelGraphPass::new("test.py", source);
         let graph = graph_pass.run(parsed.syntax());
+        let functions = Vec::new();
 
-        let mut pass = NPlusOnePass::new("test.py", source, &graph);
+        let mut pass = NPlusOnePass::new("test.py", source, &graph, &functions);
         pass.run(parsed.syntax())
     }
 
