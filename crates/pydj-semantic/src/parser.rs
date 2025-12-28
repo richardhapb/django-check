@@ -37,12 +37,7 @@ impl Parser {
         functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let source = fs::read_to_string(file)?;
-        self.analyze_source(
-            &source,
-            file.file_name().unwrap().to_str().unwrap(),
-            model_graph,
-            functions,
-        )
+        self.analyze_source(&source, file.to_str().unwrap(), model_graph, functions)
     }
 
     /// Run N+1 detection on a file or a directory, this function figure out
@@ -58,8 +53,14 @@ impl Parser {
 
         if path.is_dir() {
             for entry in Self::python_files(path) {
-                let diagnostics =
-                    self.analyze_n_plus_one_file(entry.path(), model_graph, functions)?;
+                let diagnostics = self.analyze_n_plus_one_file(
+                    entry
+                        .path()
+                        .strip_prefix(path)
+                        .expect("path derived from prefix"),
+                    model_graph,
+                    functions,
+                )?;
                 all_diagnostics.extend(diagnostics);
             }
         } else if path.is_file() {
@@ -138,13 +139,13 @@ impl Parser {
     pub fn analyze_source(
         &self,
         source: &str,
-        file_name: &str,
+        file_path: &str,
         model_graph: &ModelGraph,
         functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let parsed = self.parse_module(source)?;
 
-        let mut n1_pass = NPlusOnePass::new(file_name, source, model_graph, functions);
+        let mut n1_pass = NPlusOnePass::new(file_path, source, model_graph, functions);
         Ok(n1_pass.run(parsed.syntax()))
     }
 

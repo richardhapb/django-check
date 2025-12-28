@@ -84,27 +84,26 @@ impl LanguageServer for Backend {
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
         let mut diagnostics = Vec::new();
-        if let Some(file_name) = params
+        let file_path = params
             .text_document
             .uri
             .as_str()
             .strip_prefix("file://")
-            .unwrap_or(params.text_document.uri.as_str())
-            .split("/")
-            .last()
-        {
-            trace!(?file_name);
+            .unwrap_or(params.text_document.uri.as_str());
 
-            match self.parser.analyze_source(
-                &self.current_source.lock().unwrap(),
-                file_name,
-                &self.model_graph.lock().unwrap(),
-                &self.functions,
-            ) {
-                Ok(diags) => diagnostics = diags,
-                Err(e) => {
-                    trace!(e);
-                }
+        trace!(?file_path);
+
+        match self.parser.analyze_source(
+            &self.current_source.lock().unwrap(),
+            file_path
+                .strip_prefix(self.cwd.to_str().unwrap_or_default())
+                .unwrap_or(file_path),
+            &self.model_graph.lock().unwrap(),
+            &self.functions,
+        ) {
+            Ok(diags) => diagnostics = diags,
+            Err(e) => {
+                trace!(e);
             }
         }
 
