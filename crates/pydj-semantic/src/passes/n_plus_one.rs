@@ -362,25 +362,93 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
-        if let Expr::Attribute(attr) = expr {
-            let (base_name, attr_chain) = self.extract_attribute_chain(attr);
+        match expr {
+            Expr::Attribute(attr) => {
+                let (base_name, attr_chain) = self.extract_attribute_chain(attr);
 
-            for ctx in &self.active_loops {
-                if base_name != ctx.loop_var {
-                    continue;
+                for ctx in &self.active_loops {
+                    if base_name != ctx.loop_var {
+                        continue;
+                    }
+
+                    let is_n_plus_one =
+                        self.check_relation_chain(&ctx.queryset_context, &attr_chain);
+
+                    if is_n_plus_one {
+                        self.diagnostics.push(self.make_diagnostic(
+                            expr,
+                            &ctx.loop_var,
+                            &attr_chain.join("."),
+                        ));
+                    }
                 }
-
-                let is_n_plus_one = self.check_relation_chain(&ctx.queryset_context, &attr_chain);
-
-                if is_n_plus_one {
-                    self.diagnostics.push(self.make_diagnostic(
-                        expr,
-                        &ctx.loop_var,
-                        &attr_chain.join("."),
-                    ));
+                return;
+            }
+            Expr::Call(call) => {
+                let mut diagnostics = Vec::new();
+                for arg in call.arguments.args.iter() {
+                    if let Expr::Name(name) = arg
+                        && let Some(bind) = self.lookup(&name.id)
+                        && let Some(f) = self.functions.iter().find(|f| {
+                            call.func
+                                .as_name_expr()
+                                .is_some_and(|fname| fname.id.as_str() == f.name)
+                        })
+                        && let Some((arg_idx, _)) = call
+                            .arguments
+                            .args
+                            .iter()
+                            .enumerate()
+                            .find(|(_, a)| a.as_name_expr().is_some_and(|n| n.id == name.id))
+                    {
+                        match bind {
+                            BindingKind::QuerySet(queryset_context) => {
+                                match &queryset_context.state {
+                                    QuerySetState::Safe(safe_methods) => {
+                                        for a in f.args.iter() {
+                                            if a.idx == arg_idx
+                                                && a.attr_accesses.iter().any(|aa| {
+                                                    self.model_graph.is_relation(&a.model_name, aa)
+                                                        && !safe_methods.iter().any(|sm| {
+                                                            sm.prefetched_relations
+                                                                .iter()
+                                                                .any(|r| r == aa)
+                                                        })
+                                                })
+                                            {
+                                                diagnostics.push(self.make_diagnostic(
+                                                    expr,
+                                                    &name.id,
+                                                    &a.var_name,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    QuerySetState::Unsafe => {
+                                        for a in f.args.iter() {
+                                            if a.attr_accesses.iter().any(|aa| {
+                                                self.model_graph.is_relation(&a.model_name, aa)
+                                            }) {
+                                                diagnostics.push(self.make_diagnostic(
+                                                    expr,
+                                                    &name.id,
+                                                    &a.var_name,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            BindingKind::Unknown => {}
+                        }
+                    }
+                }
+                if !diagnostics.is_empty() {
+                    self.diagnostics.append(&mut diagnostics);
                 }
             }
-            return;
+
+            _ => {}
         }
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
@@ -388,6 +456,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
 
 #[cfg(test)]
 mod tests {
+    use crate::passes::functions::QueryFunctionPass;
     use crate::passes::model_graph::ModelGraphPass;
 
     use super::*;
@@ -397,7 +466,8 @@ mod tests {
         let parsed = parse_module(source).expect("should parse");
         let mut graph_pass = ModelGraphPass::new("test.py", source);
         let graph = graph_pass.run(parsed.syntax());
-        let functions = Vec::new();
+        let mut function_pass = QueryFunctionPass::new();
+        let functions = function_pass.run(parsed.syntax());
 
         let mut pass = NPlusOnePass::new("test.py", source, &graph, &functions);
         pass.run(parsed.syntax())
@@ -606,6 +676,49 @@ tier1 = theo_analysis.tier1s.filter(
 for t in tier1:
     for rp in t.relative_performances.all():
         pass
+        "#;
+
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn detect_traceback_relation_access() {
+        let source = r#"
+class TheoAnalysis(models.Model):
+    tier = models.CharField(max_length=11, choices=Tiers.choices)
+
+class Tier1(models.Model):
+    analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
+
+def foo(t1: QuerySet[Tier1]):
+    for t in t1:
+        print(t.analysis)
+
+tier1 = Tier1.objects.all()
+foo(tier1)
+        "#;
+
+        let diags = run_pass(source);
+        assert!(!diags.is_empty());
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn no_capture_valid_traceback_relation_access() {
+        let source = r#"
+class TheoAnalysis(models.Model):
+    tier = models.CharField(max_length=11, choices=Tiers.choices)
+
+class Tier1(models.Model):
+    analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
+
+def foo(t1: QuerySet[Tier1]):
+    for t in t1:
+        print(t.analysis)
+
+tier1 = Tier1.objects.select_related("analysis").all()
+foo(tier1)
         "#;
 
         let diags = run_pass(source);

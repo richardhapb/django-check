@@ -7,15 +7,16 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct QueryFunction {
-    name: String,
-    args: Vec<QueryArg>,
+    pub name: String,
+    pub args: Vec<QueryArg>,
 }
 
 #[derive(Debug, Clone)]
 pub struct QueryArg {
-    var_name: String,
-    model_name: String,
-    attr_accesses: HashSet<String>,
+    pub idx: usize,
+    pub var_name: String,
+    pub model_name: String,
+    pub attr_accesses: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,7 +115,7 @@ impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
             Stmt::FunctionDef(fd) => {
                 let mut query_args = Vec::new();
 
-                for arg in &fd.parameters.args {
+                for (arg_idx, arg) in fd.parameters.args.iter().enumerate() {
                     if let Some(anot) = arg.parameter.annotation()
                         && let Some(subscript) = anot.as_subscript_expr()
                         && let Expr::Name(name) = subscript.value.as_ref()
@@ -123,6 +124,7 @@ impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
                     {
                         let model_name = sl.id.as_str();
                         query_args.push(QueryArg {
+                            idx: arg_idx,
                             var_name: arg.name().to_string(),
                             model_name: self
                                 .model_aliases
@@ -247,8 +249,10 @@ def foo(qs: QuerySet[Bar], n: int, qs2: QuerySet[User]) -> None:
 
         assert_eq!(arg1.var_name, "qs");
         assert_eq!(arg1.model_name, "Bar");
+        assert_eq!(arg1.idx, 0);
         assert_eq!(arg2.var_name, "qs2");
         assert_eq!(arg2.model_name, "User");
+        assert_eq!(arg2.idx, 2);
     }
 
     #[test]
@@ -299,6 +303,7 @@ def foo(qs: QuerySet[Bar]) -> None:
         let arg = function.args.iter().next().unwrap();
         assert_eq!(arg.var_name, "qs");
         assert_eq!(arg.model_name, "Bar");
+        assert_eq!(arg.idx, 0);
 
         assert!(!arg.attr_accesses.is_empty());
         let attr = arg.attr_accesses.iter().next().unwrap();
