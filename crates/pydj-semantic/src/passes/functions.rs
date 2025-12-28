@@ -1,6 +1,9 @@
 use crate::passes::Pass;
 use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    marker::PhantomData,
+};
 
 #[derive(Debug, Clone)]
 pub struct QueryFunction {
@@ -20,22 +23,59 @@ struct FunctionScope {
     function_vars: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct LoopContext {
-    func_name: String,
-    loop_var: String,
-    orig_var: String,
+#[derive(Debug, Clone, Copy)]
+struct RawIdx(usize);
+
+#[derive(Debug)]
+struct Idx<T> {
+    raw: RawIdx,
+    _ty: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Idx<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Idx<T> {}
+
+impl<T> From<usize> for Idx<T> {
+    fn from(value: usize) -> Self {
+        Self {
+            raw: RawIdx(value),
+            _ty: PhantomData,
+        }
+    }
+}
+
+impl<T> Idx<T> {
+    fn idx(&self) -> usize {
+        self.raw.0
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueryArgId {
+    func_idx: Idx<QueryFunction>,
+    arg_idx: Idx<QueryArg>,
 }
 
 #[derive(Debug, Clone)]
-pub struct QueryFunctionPass {
+struct LoopContext<'a> {
+    arg: QueryArgId,
+    loop_var: &'a str,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueryFunctionPass<'a> {
     functions: Vec<QueryFunction>,
-    model_aliases: HashMap<String, String>,
+    model_aliases: HashMap<&'a str, &'a str>,
     function_scopes: Vec<FunctionScope>,
-    active_loops: Vec<LoopContext>,
+    active_loops: Vec<LoopContext<'a>>,
 }
 
-impl QueryFunctionPass {
+impl<'a> QueryFunctionPass<'a> {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
@@ -44,41 +84,9 @@ impl QueryFunctionPass {
             active_loops: Vec::new(),
         }
     }
-
-    /// Extract the attribute chain from a complete sentence
-    ///
-    /// Args
-    ///     attr: The attribute where begin to backward for capturing the chain
-    ///
-    /// Returns
-    ///     tuple with the base element of the sentence and all the posterior expressions
-    fn extract_attribute_chain(
-        &self,
-        attr: &ruff_python_ast::ExprAttribute,
-    ) -> (String, Vec<String>) {
-        let mut chain = vec![attr.attr.id.to_string()];
-        let mut current = attr.value.as_ref();
-
-        loop {
-            match current {
-                Expr::Attribute(attr) => {
-                    chain.push(attr.attr.id.to_string());
-                    current = attr.value.as_ref();
-                }
-                Expr::Call(call) => {
-                    current = call.func.as_ref();
-                }
-                Expr::Name(name) => {
-                    chain.reverse();
-                    return (name.id.to_string(), chain);
-                }
-                _ => return (String::new(), Vec::new()),
-            }
-        }
-    }
 }
 
-impl<'a> Pass<'a> for QueryFunctionPass {
+impl<'a> Pass<'a> for QueryFunctionPass<'a> {
     type Output = Vec<QueryFunction>;
 
     fn run(&mut self, module: &'a ModModule) -> Self::Output {
@@ -90,22 +98,23 @@ impl<'a> Pass<'a> for QueryFunctionPass {
     }
 }
 
-impl<'a> Visitor<'a> for QueryFunctionPass {
+impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         match stmt {
             Stmt::ImportFrom(import) => {
-                for name in import.names.iter() {
-                    if let Some(alias) = name.asname.as_ref() {
+                for name in &import.names {
+                    if let Some(alias) = &name.asname {
                         self.model_aliases
-                            .insert(alias.id.to_string(), name.name.id.to_string());
+                            .insert(alias.id.as_str(), name.name.id.as_str());
                     }
                 }
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
             }
+
             Stmt::FunctionDef(fd) => {
                 let mut query_args = Vec::new();
 
-                for arg in fd.parameters.args.iter() {
+                for arg in &fd.parameters.args {
                     if let Some(anot) = arg.parameter.annotation()
                         && let Some(subscript) = anot.as_subscript_expr()
                         && let Expr::Name(name) = subscript.value.as_ref()
@@ -113,13 +122,13 @@ impl<'a> Visitor<'a> for QueryFunctionPass {
                         && let Expr::Name(sl) = subscript.slice.as_ref()
                     {
                         let model_name = sl.id.as_str();
-
                         query_args.push(QueryArg {
                             var_name: arg.name().to_string(),
                             model_name: self
                                 .model_aliases
                                 .get(model_name)
-                                .map_or(model_name, |v| v)
+                                .copied()
+                                .unwrap_or(model_name)
                                 .to_string(),
                             attr_accesses: HashSet::new(),
                         });
@@ -129,42 +138,41 @@ impl<'a> Visitor<'a> for QueryFunctionPass {
                 if !query_args.is_empty() {
                     self.functions.push(QueryFunction {
                         name: fd.name.id.to_string(),
-                        args: query_args.clone(),
+                        args: query_args,
                     });
 
-                    self.function_scopes.push(FunctionScope {
-                        function_vars: query_args.iter().map(|a| a.var_name.to_string()).collect(),
-                    });
                     ruff_python_ast::visitor::walk_stmt(self, stmt);
-                    self.function_scopes.pop();
                 }
-                ruff_python_ast::visitor::walk_stmt(self, stmt);
             }
+
             Stmt::For(for_stmt) => {
                 let mut loop_inserted = false;
-                if !self.function_scopes.is_empty()
-                    && let Expr::Name(iter_name) = for_stmt.iter.as_ref()
+                if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
                     && let Expr::Name(target) = for_stmt.target.as_ref()
                 {
-                    for f in self.functions.iter() {
-                        if let Some(var) = f.args.iter().find(|a| a.var_name == iter_name.id) {
-                            self.active_loops.push(LoopContext {
-                                func_name: f.name.clone(),
-                                loop_var: target.id.to_string(),
-                                orig_var: var.var_name.clone(),
-                            });
-
-                            loop_inserted = true;
-
-                            break;
-                        }
+                    // Find the function and argument that matches this loop's iterator
+                    if let Some((f_idx, f)) = self.functions.iter().enumerate().next_back()
+                        && let Some((a_idx, _)) = f
+                            .args
+                            .iter()
+                            .enumerate()
+                            .find(|(_, a)| a.var_name == iter_name.id.as_str())
+                    {
+                        self.active_loops.push(LoopContext {
+                            arg: QueryArgId {
+                                func_idx: Idx::from(f_idx),
+                                arg_idx: Idx::from(a_idx),
+                            },
+                            loop_var: target.id.as_str(),
+                        });
+                        loop_inserted = true;
                     }
+                }
 
-                    ruff_python_ast::visitor::walk_stmt(self, stmt);
+                ruff_python_ast::visitor::walk_stmt(self, stmt);
 
-                    if loop_inserted {
-                        self.active_loops.pop();
-                    }
+                if loop_inserted {
+                    self.active_loops.pop();
                 }
             }
             _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
@@ -175,20 +183,18 @@ impl<'a> Visitor<'a> for QueryFunctionPass {
         if let Expr::Attribute(attr) = expr {
             let (base_name, attr_chain) = self.extract_attribute_chain(attr);
 
-            for ctx in &self.active_loops {
-                if base_name != ctx.loop_var {
+            for ctx in self.active_loops.iter() {
+                if ctx.loop_var != base_name {
                     continue;
                 }
 
+                let arg = &mut self.functions[ctx.arg.func_idx.idx()].args[ctx.arg.arg_idx.idx()];
                 for el in attr_chain.iter() {
-                    if let Some(f) = self.functions.iter_mut().find(|f| f.name == ctx.func_name)
-                        && let Some(arg) = f.args.iter_mut().find(|a| a.var_name == ctx.orig_var)
-                    {
-                        arg.attr_accesses.insert(el.to_string());
-                    }
+                    arg.attr_accesses.insert(el.to_string());
                 }
             }
         }
+
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
 }
@@ -293,8 +299,33 @@ def foo(qs: QuerySet[Bar]) -> None:
         let arg = function.args.iter().next().unwrap();
         assert_eq!(arg.var_name, "qs");
         assert_eq!(arg.model_name, "Bar");
+
         assert!(!arg.attr_accesses.is_empty());
         let attr = arg.attr_accesses.iter().next().unwrap();
-        assert_eq!(attr, "user");
+        assert_eq!(*attr, "user");
+    }
+
+    #[test]
+    fn attr_nested_access_detected() {
+        let source = r#"
+def foo(qs: QuerySet[Bar], qs2: QuerySet[Bar2]) -> None:
+    for q in qs:
+        for q2 in qs2:
+            print(q2.user)
+        "#;
+        let functions = run_pass(&source);
+
+        assert!(!functions.is_empty());
+        let function = functions.iter().next().unwrap();
+        assert_eq!(function.name, "foo");
+        assert!(!function.args.is_empty());
+
+        let arg = function.args.iter().last().unwrap();
+        assert_eq!(arg.var_name, "qs2");
+        assert_eq!(arg.model_name, "Bar2");
+
+        assert!(!arg.attr_accesses.is_empty());
+        let attr = arg.attr_accesses.iter().next().unwrap();
+        assert_eq!(*attr, "user");
     }
 }

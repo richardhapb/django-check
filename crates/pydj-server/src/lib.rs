@@ -74,9 +74,8 @@ impl LanguageServer for Backend {
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         debug!("method: textDocument/didChange");
-        match params.content_changes.iter().next() {
-            Some(cch) => *self.current_source.lock().unwrap() = cch.text.clone(),
-            None => {}
+        if let Some(cch) = params.content_changes.first() {
+            *self.current_source.lock().unwrap() = cch.text.clone()
         }
     }
 
@@ -97,9 +96,9 @@ impl LanguageServer for Backend {
             trace!(?file_name);
 
             match self.parser.analyze_source(
-                &*self.current_source.lock().unwrap(),
+                &self.current_source.lock().unwrap(),
                 file_name,
-                &*self.model_graph.lock().unwrap(),
+                &self.model_graph.lock().unwrap(),
                 &self.functions,
             ) {
                 Ok(diags) => diagnostics = diags,

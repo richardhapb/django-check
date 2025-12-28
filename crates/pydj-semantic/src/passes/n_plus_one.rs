@@ -119,16 +119,16 @@ impl<'a> NPlusOnePass<'a> {
                         continue; // Already captured
                     }
                     let (base, chain) = self.extract_attribute_chain(attr);
-                    model = self.model_graph.get(&base);
+                    model = self.model_graph.get(base);
 
                     if model.is_some() {
                         // Check for chained access if a model name
                         // was detected
                         for expr in chain.iter() {
-                            if self.model_graph.is_relation(&base, expr) {
+                            if self.model_graph.is_relation(base, expr) {
                                 model = self
                                     .model_graph
-                                    .get_relation(&base, expr)
+                                    .get_relation(base, expr)
                                     .and_then(|m| self.model_graph.get(m));
                                 break;
                             }
@@ -136,7 +136,7 @@ impl<'a> NPlusOnePass<'a> {
                     }
 
                     if model.is_none()
-                        && let Some(captured) = self.lookup(&base)
+                        && let Some(captured) = self.lookup(base)
                     {
                         match captured {
                             BindingKind::QuerySet(ctx) => {
@@ -164,7 +164,7 @@ impl<'a> NPlusOnePass<'a> {
 
                                     model = self
                                         .model_graph
-                                        .get_relation(&base, attr.attr.id.as_str())
+                                        .get_relation(base, attr.attr.id.as_str())
                                         .and_then(|m| self.model_graph.get(m));
                                 }
                             }
@@ -271,39 +271,7 @@ impl<'a> NPlusOnePass<'a> {
         )
     }
 
-    /// Extract the attribute chain from a complete sentence
-    ///
-    /// Args
-    ///     attr: The attribute where begin to backward for capturing the chain
-    ///
-    /// Returns
-    ///     tuple with the base element of the sentence and all the posterior expressions
-    fn extract_attribute_chain(
-        &self,
-        attr: &ruff_python_ast::ExprAttribute,
-    ) -> (String, Vec<String>) {
-        let mut chain = vec![attr.attr.id.to_string()];
-        let mut current = attr.value.as_ref();
-
-        loop {
-            match current {
-                Expr::Attribute(attr) => {
-                    chain.push(attr.attr.id.to_string());
-                    current = attr.value.as_ref();
-                }
-                Expr::Call(call) => {
-                    current = call.func.as_ref();
-                }
-                Expr::Name(name) => {
-                    chain.reverse();
-                    return (name.id.to_string(), chain);
-                }
-                _ => return (String::new(), Vec::new()),
-            }
-        }
-    }
-
-    fn check_relation_chain(&self, ctx: &QuerySetContext, chain: &[String]) -> bool {
+    fn check_relation_chain(&self, ctx: &QuerySetContext, chain: &[&'a str]) -> bool {
         let Some(ref model_name) = ctx.model else {
             return false;
         };

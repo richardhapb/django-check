@@ -131,7 +131,7 @@ impl Parser {
         model_graph: &ModelGraph,
         functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
-        Ok(self.analyze_n_plus_one_file(file, model_graph, functions)?)
+        self.analyze_n_plus_one_file(file, model_graph, functions)
     }
 
     /// Run all analyses in a source code and return diagnostics
@@ -144,7 +144,7 @@ impl Parser {
     ) -> Result<Vec<NPlusOneDiagnostic>, Box<dyn std::error::Error>> {
         let parsed = self.parse_module(source)?;
 
-        let mut n1_pass = NPlusOnePass::new(file_name, &source, model_graph, functions);
+        let mut n1_pass = NPlusOnePass::new(file_name, source, model_graph, functions);
         Ok(n1_pass.run(parsed.syntax()))
     }
 

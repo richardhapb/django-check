@@ -32,22 +32,22 @@ impl NPlusOneDiagnostic {
     }
 }
 
-impl Into<Diagnostic> for NPlusOneDiagnostic {
-    fn into(self) -> Diagnostic {
+impl From<NPlusOneDiagnostic> for Diagnostic {
+    fn from(value: NPlusOneDiagnostic) -> Self {
         Diagnostic {
             range: Range::new(
-                Position::new(self.line.saturating_sub(1) as u32, self.col.saturating_sub(1) as u32),
-                Position::new(self.line.saturating_sub(1) as u32, (self.col.saturating_sub(1) + self.access.len()) as u32),
+                Position::new(value.line.saturating_sub(1) as u32, value.col.saturating_sub(1) as u32),
+                Position::new(value.line.saturating_sub(1) as u32, (value.col.saturating_sub(1) + value.access.len()) as u32),
             ),
             severity: Some(DiagnosticSeverity::WARNING),
-            code: Some(NumberOrString::String(self.code.to_string())),
+            code: Some(NumberOrString::String(value.code.to_string())),
             code_description: Some(CodeDescription {
                 href: Url::parse(
                     "http://docs.djangoproject.com/en/6.0/topics/db/optimization/#use-queryset-select-related-and-prefetch-related",
                 ).expect("valid str"),
             }),
             source: Some("pydjavu".into()),
-            message: self.message,
+            message: value.message,
             related_information: None,
             tags: None,
             data: None,
