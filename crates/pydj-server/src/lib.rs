@@ -103,7 +103,7 @@ impl LanguageServer for Backend {
         ) {
             Ok(diags) => diagnostics = diags,
             Err(e) => {
-                trace!(e);
+                debug!(e);
             }
         }
 
