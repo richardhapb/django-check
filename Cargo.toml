@@ -9,9 +9,9 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.dependencies]
-pydj = { path = "crates/pydj" }
-pydj_semantic = { path = "crates/pydj-semantic" }
-pydj_server = { path = "crates/pydj-server" }
+django-check = { path = "crates/django-check" }
+django-check_semantic = { path = "crates/django-check_semantic" }
+django-check_server = { path = "crates/django-check_server" }
 tokio = { version = "1.48.0", features = ["macros", "io-std", "rt-multi-thread"] }
 tracing = { version = "0.1.44" }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }

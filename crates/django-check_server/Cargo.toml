@@ -1,5 +1,5 @@
 [package]
-name = "pydj_server"
+name = "django-check_server"
 version = "0.1.0"
 rust-version = { workspace = true }
 license = { workspace = true }
@@ -7,7 +7,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-pydj_semantic = { workspace = true }
+django-check_semantic = { workspace = true }
 
 tower-lsp = "0.20.0"
 tokio = { workspace = true }

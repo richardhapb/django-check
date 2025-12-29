@@ -1,5 +1,5 @@
 [package]
-name = "pydj_semantic"
+name = "django-check_semantic"
 version = "0.0.0"
 rust-version = { workspace = true }
 license = { workspace = true }

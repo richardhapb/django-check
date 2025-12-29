@@ -259,6 +259,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "django-check"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "django-check_semantic",
+ "django-check_server",
+ "tokio",
+]
+
+[[package]]
+name = "django-check_semantic"
+version = "0.0.0"
+dependencies = [
+ "lsp-types",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
+ "walkdir",
+]
+
+[[package]]
+name = "django-check_server"
+version = "0.1.0"
+dependencies = [
+ "django-check_semantic",
+ "tokio",
+ "tower-lsp",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -788,38 +820,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "pydj"
-version = "0.1.0"
-dependencies = [
- "clap",
- "pydj_semantic",
- "pydj_server",
- "tokio",
-]
-
-[[package]]
-name = "pydj_semantic"
-version = "0.0.0"
-dependencies = [
- "lsp-types",
- "ruff_python_ast",
- "ruff_python_parser",
- "ruff_text_size",
- "walkdir",
-]
-
-[[package]]
-name = "pydj_server"
-version = "0.1.0"
-dependencies = [
- "pydj_semantic",
- "tokio",
- "tower-lsp",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

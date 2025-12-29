@@ -1,7 +1,7 @@
 mod cli;
 
-use pydj_semantic::Parser;
-use pydj_server::serve;
+use django_check_semantic::Parser;
+use django_check_server::serve;
 use std::env::current_dir;
 
 use clap::Parser as ClapParser;

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pydj_semantic::{ModelGraph, Parser, QueryFunction};
+use django_check_semantic::{ModelGraph, Parser, QueryFunction};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -127,13 +127,13 @@ impl LanguageServer for Backend {
 
 fn build_server_info() -> ServerInfo {
     ServerInfo {
-        name: "pydjavu".into(),
+        name: "django-checkavu".into(),
         version: Some("0.0.1".into()),
     }
 }
 
 pub async fn serve(cwd: &Path) {
-    let log_path = Path::new("/tmp/pydj.log");
+    let log_path = Path::new("/tmp/django-check.log");
     let file = fs::File::create(log_path).expect("create the log file");
     tracing_subscriber::fmt()
         .with_writer(file)

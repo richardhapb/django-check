@@ -1,13 +1,17 @@
 [package]
-name = "pydj"
+name = "django-check"
 version = "0.1.0"
 rust-version = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 edition = { workspace = true }
 
+[[bin]]
+name = "djch"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
-pydj_semantic = { workspace = true }
-pydj_server = { workspace = true }
+django-check_semantic = { workspace = true }
+django-check_server = { workspace = true }
 tokio = { workspace = true }

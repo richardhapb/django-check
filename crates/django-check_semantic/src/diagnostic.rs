@@ -46,7 +46,7 @@ impl From<NPlusOneDiagnostic> for Diagnostic {
                     "http://docs.djangoproject.com/en/6.0/topics/db/optimization/#use-queryset-select-related-and-prefetch-related",
                 ).expect("valid str"),
             }),
-            source: Some("pydjavu".into()),
+            source: Some("django-checkavu".into()),
             message: value.message,
             related_information: None,
             tags: None,
