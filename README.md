@@ -4,7 +4,7 @@ Static N+1 query detection for Django (LSP-based)
 
 `django-check` is a static analyzer and Language Server that detects N+1 query patterns in Django code before runtime. It inspects queryset construction and related-field access to warn when relations are accessed without proper prefetching (`select_related`, `prefetch_related`).
 
-<img width="1353" height="415" alt="image" src="https://github.com/user-attachments/assets/99bb6566-6372-4fef-a765-a2d4247a0311" />
+<img width="1049" height="287" alt="image" src="https://github.com/user-attachments/assets/34103185-f6a1-4bc5-950a-ebf2b46b7d9f" />
 
 
 The goal is not to replace runtime profilers, but to shift performance feedback left, into the editor.
