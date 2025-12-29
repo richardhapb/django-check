@@ -23,6 +23,7 @@ pub enum QuerySetState {
 #[derive(Debug, Clone)]
 pub enum BindingKind {
     QuerySet(QuerySetContext),
+    ModelInstance(String),
     Unknown,
 }
 

@@ -13,7 +13,7 @@ use crate::diagnostic::NPlusOneDiagnostic;
 use crate::ir::binding::{
     BindingKind, QuerySetContext, QuerySetState, SafeMethod, parse_relation_fields,
 };
-use crate::ir::model::ModelGraph;
+use crate::ir::model::{ModelDef, ModelGraph};
 use crate::passes::{Pass, functions::QueryFunction};
 
 const DIAGNOSTIC_CODE: &str = "N+1";
@@ -104,6 +104,15 @@ impl<'a> NPlusOnePass<'a> {
         let mut curr_expr = expr;
         let mut model = None;
 
+        if let Expr::Call(call) = expr
+            && let Expr::Name(func_name) = call.func.as_ref()
+            && func_name.id == "get_object_or_404"
+             // First arg is the model class
+            && let Some(Expr::Name(model_name)) = call.arguments.args.first()
+        {
+            return BindingKind::ModelInstance(model_name.id.to_string());
+        }
+
         loop {
             match curr_expr {
                 Expr::Call(call) => {
@@ -145,17 +154,7 @@ impl<'a> NPlusOnePass<'a> {
                                     .as_ref()
                                     .and_then(|m| self.model_graph.get(m.as_str()))
                                 {
-                                    // Check for chained access if a model variable
-                                    // was detected
-                                    for expr in chain.iter() {
-                                        if self.model_graph.is_relation(&related_model.name, expr) {
-                                            model = self
-                                                .model_graph
-                                                .get_relation(&related_model.name, expr)
-                                                .and_then(|m| self.model_graph.get(m));
-                                            break;
-                                        }
-                                    }
+                                    model = self.try_get_related_model(&chain, &related_model.name);
 
                                     // Skip if the model was found in the last step
                                     if model.is_some() {
@@ -168,7 +167,20 @@ impl<'a> NPlusOnePass<'a> {
                                         .and_then(|m| self.model_graph.get(m));
                                 }
                             }
-                            BindingKind::Unknown => {}
+                            BindingKind::ModelInstance(instance) => {
+                                model = self.try_get_related_model(&chain, instance);
+
+                                // Skip if the model was found in the last step
+                                if model.is_some() {
+                                    continue;
+                                }
+
+                                model = self
+                                    .model_graph
+                                    .get_relation(base, attr.attr.id.as_str())
+                                    .and_then(|m| self.model_graph.get(m));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -192,7 +204,8 @@ impl<'a> NPlusOnePass<'a> {
                                     model: model.map(|m| m.name.clone()),
                                 });
                             }
-                            BindingKind::Unknown => {}
+
+                            _ => {}
                         };
                     }
                     break;
@@ -215,6 +228,23 @@ impl<'a> NPlusOnePass<'a> {
             state,
             model: Some(model_instance.name.clone()),
         })
+    }
+
+    fn try_get_related_model(&self, chain: &[&'a str], model_name: &str) -> Option<&ModelDef> {
+        let mut model = None;
+        // Check for chained access if a model variable
+        // was detected
+        for expr in chain.iter() {
+            if self.model_graph.is_relation(model_name, expr) {
+                model = self
+                    .model_graph
+                    .get_relation(model_name, expr)
+                    .and_then(|m| self.model_graph.get(m));
+                break;
+            }
+        }
+
+        model
     }
 
     fn get_safe_method(&self, call: &ruff_python_ast::ExprCall) -> Option<SafeMethod> {
@@ -336,14 +366,30 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 let mut pushed_loop = false;
 
                 if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
-                    && let Some(BindingKind::QuerySet(context)) = self.lookup(iter_name.id.as_str())
                     && let Expr::Name(target) = for_stmt.target.as_ref()
                 {
-                    self.active_loops.push(LoopContext {
-                        loop_var: target.id.to_string(),
-                        queryset_context: context.clone(),
-                    });
-                    pushed_loop = true;
+                    match self.lookup(iter_name.id.as_str()) {
+                        Some(BindingKind::QuerySet(context)) => {
+                            self.active_loops.push(LoopContext {
+                                loop_var: target.id.to_string(),
+                                queryset_context: context.clone(),
+                            });
+                            pushed_loop = true;
+                        }
+                        Some(BindingKind::ModelInstance(instance)) => {
+                            let context = QuerySetContext {
+                                model: Some(instance.clone()),
+                                state: QuerySetState::Unsafe,
+                            };
+
+                            self.active_loops.push(LoopContext {
+                                loop_var: target.id.to_string(),
+                                queryset_context: context.clone(),
+                            });
+                            pushed_loop = true;
+                        }
+                        _ => {}
+                    }
                 }
 
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
@@ -439,7 +485,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                                     }
                                 }
                             }
-                            BindingKind::Unknown => {}
+                            _ => {}
                         }
                     }
                 }
@@ -723,5 +769,43 @@ foo(tier1)
 
         let diags = run_pass(source);
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn detect_n1_after_get_object_or_404() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+user = get_object_or_404(User, id=1)
+orders = user.orders.all()
+
+for order in orders:
+    print(order)  # Should NOT warn (no relation access)
+    print(order.user)  # Should warn (N+1)
+"#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_n1_directly_all_in_for() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+user = User.objects.get(id=1)
+for order in user.orders.all():
+    print(order)  # Should NOT warn (no relation access)
+    print(order.user)  # Should warn (N+1)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
     }
 }
