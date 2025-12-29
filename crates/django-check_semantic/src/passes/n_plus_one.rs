@@ -365,30 +365,65 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
             Stmt::For(for_stmt) => {
                 let mut pushed_loop = false;
 
-                if let Expr::Name(iter_name) = for_stmt.iter.as_ref()
-                    && let Expr::Name(target) = for_stmt.target.as_ref()
-                {
-                    match self.lookup(iter_name.id.as_str()) {
-                        Some(BindingKind::QuerySet(context)) => {
-                            self.active_loops.push(LoopContext {
-                                loop_var: target.id.to_string(),
-                                queryset_context: context.clone(),
-                            });
-                            pushed_loop = true;
-                        }
-                        Some(BindingKind::ModelInstance(instance)) => {
-                            let context = QuerySetContext {
-                                model: Some(instance.clone()),
-                                state: QuerySetState::Unsafe,
-                            };
+                let mut iter = for_stmt.iter.as_ref();
+                let mut curr_qs = None;
+                let mut is_call = false;
 
-                            self.active_loops.push(LoopContext {
-                                loop_var: target.id.to_string(),
-                                queryset_context: context.clone(),
-                            });
-                            pushed_loop = true;
+                loop {
+                    match iter {
+                        Expr::Name(iter_name) => {
+                            if let Expr::Name(target) = for_stmt.target.as_ref() {
+                                if curr_qs.is_none() {
+                                    curr_qs = self.lookup(iter_name.id.as_str()).map(|k| k.clone());
+                                }
+
+                                match &curr_qs {
+                                    Some(BindingKind::QuerySet(context)) => {
+                                        self.active_loops.push(LoopContext {
+                                            loop_var: target.id.to_string(),
+                                            queryset_context: context.clone(),
+                                        });
+                                        pushed_loop = true;
+                                    }
+                                    Some(BindingKind::ModelInstance(instance)) => {
+                                        let context = QuerySetContext {
+                                            model: Some(instance.clone()),
+                                            state: QuerySetState::Unsafe,
+                                        };
+
+                                        self.active_loops.push(LoopContext {
+                                            loop_var: target.id.to_string(),
+                                            queryset_context: context.clone(),
+                                        });
+                                        pushed_loop = true;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            break;
                         }
-                        _ => {}
+                        Expr::Call(call) => {
+                            // Ensure the data is stored in cases when for is in the form
+                            // `for order in user.orders.all(): ... where user is an instance of User
+                            self.record_assignment(&for_stmt.target, &for_stmt.iter);
+                            // TODO: classify_expr is calculated twice
+                            curr_qs = Some(self.classify_expr(&for_stmt.iter));
+                            iter = &call.func;
+                            is_call = true;
+                        }
+                        Expr::Attribute(attr) => {
+                            // Ensure the data is stored in cases when for is in the form
+                            // `for order in user.orders: ... where user is an instance of User
+                            // if expr is a Call, that can be in the form user.orders.filter(..)
+                            if !is_call {
+                                self.record_assignment(&for_stmt.target, &for_stmt.iter);
+                                // TODO: classify_expr is calculated twice
+                                curr_qs = Some(self.classify_expr(&for_stmt.iter));
+                            }
+
+                            iter = &attr.value
+                        }
+                        _ => break,
                     }
                 }
 
@@ -802,6 +837,42 @@ class Order(Model):
 
 user = User.objects.get(id=1)
 for order in user.orders.all():
+    print(order)  # Should NOT warn (no relation access)
+    print(order.user)  # Should warn (N+1)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_n1_directly_in_for() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+user = User.objects.get(id=1)
+for order in user.orders:
+    print(order)  # Should NOT warn (no relation access)
+    print(order.user)  # Should warn (N+1)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_n1_filter_directly_in_for() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+user = User.objects.get(id=1)
+for order in user.orders.filter(id__lt=10):
     print(order)  # Should NOT warn (no relation access)
     print(order.user)  # Should warn (N+1)
     "#;
