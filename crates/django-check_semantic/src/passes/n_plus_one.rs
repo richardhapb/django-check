@@ -402,11 +402,12 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             }
                             break;
                         }
+                        // In both cases is not necessary to record the classification because
+                        // are temporary values in the `for` and we call walk_stmt here, then
+                        // drop the classification is ok
                         Expr::Call(call) => {
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders.all(): ... where user is an instance of User
-                            self.record_assignment(&for_stmt.target, &for_stmt.iter);
-                            // TODO: classify_expr is calculated twice
                             curr_qs = Some(self.classify_expr(&for_stmt.iter));
                             iter = &call.func;
                             is_call = true;
@@ -416,8 +417,6 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             // `for order in user.orders: ... where user is an instance of User
                             // if expr is a Call, that can be in the form user.orders.filter(..)
                             if !is_call {
-                                self.record_assignment(&for_stmt.target, &for_stmt.iter);
-                                // TODO: classify_expr is calculated twice
                                 curr_qs = Some(self.classify_expr(&for_stmt.iter));
                             }
 
