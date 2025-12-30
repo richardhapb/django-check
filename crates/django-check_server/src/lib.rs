@@ -1,4 +1,3 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -8,8 +7,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use tracing::{debug, info, trace};
-use tracing_subscriber::{self, EnvFilter};
+use tracing::{debug, error, info, trace};
 
 #[derive(Debug, Clone)]
 struct Backend {
@@ -103,7 +101,7 @@ impl LanguageServer for Backend {
         ) {
             Ok(diags) => diagnostics = diags,
             Err(e) => {
-                debug!(e);
+                debug!(?e);
             }
         }
 
@@ -127,24 +125,23 @@ impl LanguageServer for Backend {
 
 fn build_server_info() -> ServerInfo {
     ServerInfo {
-        name: "django-checkavu".into(),
+        name: "django-check".into(),
         version: Some("0.0.1".into()),
     }
 }
 
 pub async fn serve(cwd: &Path) {
-    let log_path = Path::new("/tmp/django-check.log");
-    let file = fs::File::create(log_path).expect("create the log file");
-    tracing_subscriber::fmt()
-        .with_writer(file)
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
     info!("Initializing LSP");
 
     let parser = Parser::new();
-    let model_graph = parser.extract_model_graph(cwd).expect("parse model graph");
-    let functions = parser.extract_functions(cwd).expect("extract functions");
+    let model_graph = parser.extract_model_graph(cwd).unwrap_or_else(|e| {
+        error!(%e, "parse model graph");
+        std::process::exit(1);
+    });
+    let functions = parser.extract_functions(cwd).unwrap_or_else(|e| {
+        error!(%e, "parse functions");
+        std::process::exit(1);
+    });
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();

@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive"] }
+
 django-check_semantic = { workspace = true }
 django-check_server = { workspace = true }
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }

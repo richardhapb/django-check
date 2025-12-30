@@ -266,6 +266,7 @@ dependencies = [
  "django-check_semantic",
  "django-check_server",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -276,6 +277,7 @@ dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",
  "ruff_text_size",
+ "tracing",
  "walkdir",
 ]
 

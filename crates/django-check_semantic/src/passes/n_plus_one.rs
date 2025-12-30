@@ -106,7 +106,7 @@ impl<'a> NPlusOnePass<'a> {
 
         if let Expr::Call(call) = expr
             && let Expr::Name(func_name) = call.func.as_ref()
-            && func_name.id == "get_object_or_404"
+            && func_name.id.ends_with("get_object_or_404") // matches the async version too
              // First arg is the model class
             && let Some(Expr::Name(model_name)) = call.arguments.args.first()
         {
@@ -402,7 +402,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             }
                             break;
                         }
-                        // In both cases is not necessary to record the classification because
+                        // In both cases are not necessary to record the classification because
                         // are temporary values in the `for` and we call walk_stmt here, then
                         // drop the classification is ok
                         Expr::Call(call) => {
