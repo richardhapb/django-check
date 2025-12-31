@@ -144,14 +144,14 @@ impl<'a> ModelGraphPass<'a> {
 
         let related_name = self.extract_related_name(call);
 
-        let relation = Relation {
-            field_name,
-            target_model,
-            relation_type,
-            related_name,
-        };
-
         if let Some(ref mut model) = self.current_model {
+            let relation = Relation::new(
+                &model.name,
+                field_name,
+                target_model,
+                relation_type,
+                related_name,
+            );
             model.add_relation(relation);
         }
     }
@@ -251,7 +251,7 @@ class Order(models.Model):
         let product_rel = &order.relations[1];
         assert_eq!(product_rel.field_name, "product");
         assert_eq!(product_rel.target_model, "Product");
-        assert_eq!(product_rel.related_name, Some("orders".into()));
+        assert_eq!(product_rel.related_name(), "orders");
     }
 
     #[test]

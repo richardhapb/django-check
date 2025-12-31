@@ -15,7 +15,51 @@ pub struct Relation {
     pub field_name: String,
     pub target_model: String,
     pub relation_type: RelationType,
-    pub related_name: Option<String>,
+    related_name: String,
+}
+
+impl Relation {
+    pub fn new(
+        model_name: &str,
+        field_name: String,
+        target_model: String,
+        relation_type: RelationType,
+        related_name: Option<String>,
+    ) -> Self {
+        Self {
+            field_name,
+            target_model,
+            related_name: Self::resolve_related_name(related_name, &relation_type, model_name),
+            relation_type,
+        }
+    }
+
+    pub fn related_name(&self) -> &str {
+        &self.related_name
+    }
+
+    fn resolve_related_name(
+        related_name: Option<String>,
+        relation_type: &RelationType,
+        model_name: &str,
+    ) -> String {
+        let model_name = model_name.to_lowercase();
+        match related_name.as_ref() {
+            // django uses %(class)s to replace dynamically the class name
+            Some(related_name) => related_name.replace("%(class)s", &model_name),
+            None => {
+                match relation_type {
+                    // ManyTo relation by default uses model_name in lowercase with `_set` as a
+                    // prefix
+                    RelationType::ManyToMany
+                    | RelationType::ForeignKey
+                    | RelationType::GenericForeignKey => format!("{}_set", model_name.to_string()),
+                    // One to one use the model name directly
+                    RelationType::OneToOne => model_name.to_string(),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,10 +136,8 @@ impl ModelGraph {
         // Reverse: related_names from models pointing to this one
         for m in self.dependents(model_name) {
             for r in &m.relations {
-                if r.target_model == model_name
-                    && let Some(related_name) = &r.related_name
-                {
-                    result.push(related_name.as_str());
+                if r.target_model == model_name {
+                    result.push(r.related_name.as_str());
                 }
             }
         }
@@ -116,9 +158,7 @@ impl ModelGraph {
         // Reverse: related_names from models pointing to this one
         for m in self.dependents(model_name) {
             for r in &m.relations {
-                if r.target_model == model_name
-                    && r.related_name.as_ref().is_some_and(|rn| rn == related_name)
-                {
+                if r.target_model == model_name && r.related_name == related_name {
                     return Some(m.name.as_str());
                 }
             }
@@ -176,13 +216,13 @@ mod tests {
             field_name: "user".into(),
             target_model: "User".into(),
             relation_type: RelationType::ForeignKey,
-            related_name: Some("orders".into()),
+            related_name: "orders".into(),
         });
         model.add_relation(Relation {
             field_name: "product".into(),
             target_model: "Product".into(),
             relation_type: RelationType::ForeignKey,
-            related_name: None,
+            related_name: "product_set".into(),
         });
 
         let deps: Vec<_> = model.dependencies().collect();
@@ -200,7 +240,7 @@ mod tests {
             field_name: "user".into(),
             target_model: "User".into(),
             relation_type: RelationType::ForeignKey,
-            related_name: None,
+            related_name: "user_set".into(),
         });
 
         let mut profile = ModelDef::new("Profile", "users/models.py", 50);
@@ -208,7 +248,7 @@ mod tests {
             field_name: "user".into(),
             target_model: "User".into(),
             relation_type: RelationType::OneToOne,
-            related_name: None,
+            related_name: "user_set".into(),
         });
 
         graph.add_model(user);
@@ -217,5 +257,53 @@ mod tests {
 
         let user_dependents = graph.dependents("User");
         assert_eq!(user_dependents.len(), 2);
+    }
+
+    #[test]
+    fn resolve_related_name_default_set() {
+        let rel = Relation::new(
+            "User",
+            "country".into(),
+            "Country".into(),
+            RelationType::ForeignKey,
+            None,
+        );
+        assert_eq!(rel.related_name(), "user_set");
+    }
+
+    #[test]
+    fn resolve_related_name_default_one() {
+        let rel = Relation::new(
+            "User",
+            "country".into(),
+            "Country".into(),
+            RelationType::OneToOne,
+            None,
+        );
+        assert_eq!(rel.related_name(), "user");
+    }
+
+    #[test]
+    fn resolve_related_name_explicit() {
+        let rel = Relation::new(
+            "User",
+            "country".into(),
+            "Country".into(),
+            RelationType::OneToOne,
+            Some("users".into()),
+        );
+        assert_eq!(rel.related_name(), "users");
+    }
+
+    #[test]
+    fn resolve_related_name_using_class() {
+        let rel = Relation::new(
+            "User",
+            "country".into(),
+            "Country".into(),
+            RelationType::OneToOne,
+            Some("%(class)s_elements".into()),
+        );
+        assert_eq!(rel.related_name(), "user_elements");
     }
 }
