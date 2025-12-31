@@ -65,21 +65,29 @@ impl Relation {
 #[derive(Debug, Clone)]
 pub struct ModelDef {
     pub name: String,
-    pub app_label: Option<String>,
     pub file_path: String,
     pub line: usize,
     pub relations: Vec<Relation>,
+    is_abstract: bool,
 }
 
 impl ModelDef {
     pub fn new(name: impl Into<String>, file_path: impl Into<String>, line: usize) -> Self {
         Self {
             name: name.into(),
-            app_label: None,
             file_path: file_path.into(),
             line,
             relations: Vec::new(),
+            is_abstract: false,
         }
+    }
+
+    pub fn is_abstract(&self) -> bool {
+        self.is_abstract
+    }
+
+    pub fn mark_as_abstract(&mut self) {
+        self.is_abstract = true
     }
 
     pub fn add_relation(&mut self, relation: Relation) {

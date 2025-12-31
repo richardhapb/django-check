@@ -8,7 +8,6 @@ pub struct QuerySetContext {
 
 #[derive(Debug, Clone)]
 pub struct SafeMethod {
-    pub name: String,
     pub prefetched_relations: Vec<String>,
 }
 

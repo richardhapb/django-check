@@ -19,11 +19,6 @@ pub struct QueryArg {
     pub attr_accesses: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
-struct FunctionScope {
-    function_vars: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct RawIdx(usize);
 
@@ -72,7 +67,6 @@ struct LoopContext<'a> {
 pub struct QueryFunctionPass<'a> {
     functions: Vec<QueryFunction>,
     model_aliases: HashMap<&'a str, &'a str>,
-    function_scopes: Vec<FunctionScope>,
     active_loops: Vec<LoopContext<'a>>,
 }
 
@@ -81,7 +75,6 @@ impl<'a> QueryFunctionPass<'a> {
         Self {
             functions: Vec::new(),
             model_aliases: HashMap::new(),
-            function_scopes: Vec::new(),
             active_loops: Vec::new(),
         }
     }

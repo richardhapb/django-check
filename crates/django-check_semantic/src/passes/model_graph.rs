@@ -5,6 +5,10 @@
 //! - ForeignKey, OneToOneField, ManyToManyField declarations
 //! - related_name and other field options
 
+use core::slice::SlicePattern;
+use std::collections::{HashMap, HashSet};
+
+use ruff_python_ast::StmtClassDef;
 use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
 use ruff_text_size::Ranged;
 
@@ -18,11 +22,23 @@ const RELATION_FIELDS: [(&str, RelationType); 4] = [
     ("GenericForeignKey", RelationType::GenericForeignKey),
 ];
 
+#[derive(PartialEq, Debug, Clone)]
+pub(crate) struct PotentialModel(pub (usize, StmtClassDef));
+
+impl Eq for PotentialModel {}
+impl std::hash::Hash for PotentialModel {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.0.hash(state);
+    }
+}
+
 pub struct ModelGraphPass<'a> {
     filename: &'a str,
     source: &'a str,
     graph: ModelGraph,
     current_model: Option<ModelDef>,
+    children_count: usize,
+    children: HashSet<PotentialModel>,
 }
 
 impl<'a> ModelGraphPass<'a> {
@@ -32,6 +48,8 @@ impl<'a> ModelGraphPass<'a> {
             source,
             graph: ModelGraph::new(),
             current_model: None,
+            children_count: 0,
+            children: HashSet::new(),
         }
     }
 
@@ -66,95 +84,175 @@ impl<'a> ModelGraphPass<'a> {
         false
     }
 
-    /// Extract relation type from a field call
-    fn get_relation_type(&self, call: &ruff_python_ast::ExprCall) -> Option<RelationType> {
-        let name = match call.func.as_ref() {
-            // models.ForeignKey(...)
-            Expr::Attribute(attr) => attr.attr.id.as_str(),
-            // ForeignKey(...) - direct import
-            Expr::Name(name) => name.id.as_str(),
-            _ => return None,
-        };
-
-        RELATION_FIELDS
-            .iter()
-            .find(|(field_name, _)| *field_name == name)
-            .map(|(_, rel_type)| rel_type.clone())
+    /// Insert a new potential child and track the state of the counter
+    fn insert_potential_model(&mut self, class_stmt: &'a StmtClassDef) {
+        self.children
+            .insert(PotentialModel((self.children_count, class_stmt.clone())));
+        self.children_count += 1;
     }
 
-    /// Extract the target model from a relation field
-    fn extract_target_model(&self, call: &ruff_python_ast::ExprCall) -> Option<String> {
-        // First positional argument is the target model
-        let first_arg = call.arguments.args.first()?;
-
-        match first_arg {
-            // String reference: ForeignKey('ModelName') or ForeignKey('app.ModelName')
-            Expr::StringLiteral(s) => {
-                let value = s.value.to_string();
-                // Handle 'app.Model' format - take the model name
-                Some(value.split('.').next_back().unwrap_or(&value).to_string())
-            }
-            // Direct reference: ForeignKey(ModelName)
-            Expr::Name(name) => Some(name.id.to_string()),
-            // models.Model style isn't typically used for FK targets but handle it
-            Expr::Attribute(attr) => Some(attr.attr.id.to_string()),
-            _ => None,
-        }
-    }
-
-    /// Extract related_name from field kwargs
-    fn extract_related_name(&self, call: &ruff_python_ast::ExprCall) -> Option<String> {
-        for keyword in call.arguments.keywords.iter() {
-            if let Some(arg) = &keyword.arg
-                && arg.as_str() == "related_name"
-                && let Expr::StringLiteral(s) = &keyword.value
-            {
-                return Some(s.value.to_string());
-            }
-        }
-        None
+    fn process_class_body_stmt_for_model(&self, model: &mut ModelDef, stmt: &Stmt) {
+        process_class_body_stmt_for_model(model, stmt);
     }
 
     /// Process a class body statement to find relation fields
     fn process_class_body_stmt(&mut self, stmt: &Stmt) {
-        // Looking for: field_name = models.ForeignKey(...)
-        let Stmt::Assign(assign) = stmt else { return };
-
-        // Get field name
-        // user = models.ForeignKey(...)
-        // ^^^^
-        let Some(Expr::Name(target)) = assign.targets.first() else {
-            return;
-        };
-        let field_name = target.id.to_string();
-
-        // Get the call expression
-        // user = models.ForeignKey(...)
-        //        ^^^^^^^^^^^^^^^^^^^^^^
-        let Expr::Call(call) = assign.value.as_ref() else {
-            return;
-        };
-
-        let Some(relation_type) = self.get_relation_type(call) else {
-            return;
-        };
-        let Some(target_model) = self.extract_target_model(call) else {
-            return;
-        };
-
-        let related_name = self.extract_related_name(call);
-
-        if let Some(ref mut model) = self.current_model {
-            let relation = Relation::new(
-                &model.name,
-                field_name,
-                target_model,
-                relation_type,
-                related_name,
-            );
-            model.add_relation(relation);
+        if let Some(model) = self.current_model.as_mut() {
+            process_class_body_stmt_for_model(model, stmt);
         }
     }
+
+    fn resolve_potential_children(&mut self) {
+        let abstract_models: HashMap<String, ModelDef> = self
+            .graph
+            .models()
+            .filter(|&m| m.is_abstract())
+            .map(|m| (m.name.clone(), m.clone()))
+            .collect();
+
+        for potential in self.children.iter() {
+            let (_, class_def) = &potential.0;
+
+            // Find parent
+            let parent_name = self.find_parent_name(class_def);
+            let Some(parent) = parent_name.and_then(|n| abstract_models.get(n)) else {
+                continue;
+            };
+
+            // Create child model with parent's relations
+            let mut child = ModelDef::new(
+                class_def.name.to_string(),
+                self.filename,
+                self.line_number(class_def.range().start().to_usize()),
+            );
+
+            // Copy parent relations
+            child.relations.extend(parent.relations.clone());
+
+            // Parse child's own relations
+            for stmt in class_def.body.iter() {
+                self.process_class_body_stmt_for_model(&mut child, stmt);
+            }
+
+            self.graph.add_model(child);
+        }
+    }
+
+    fn find_parent_name(&self, class_def: &'a StmtClassDef) -> Option<&'a str> {
+        let args = class_def.arguments.as_ref()?.args.as_slice();
+
+        for arg in args {
+            if let Some(name_expr) = arg.as_name_expr() {
+                let name = name_expr.id.as_str();
+                if self.graph.models().any(|m| &m.name == name) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+}
+
+/// Process the body of a class, capturing if it is abstract or a django relation
+fn process_class_body_stmt_for_model(model: &mut ModelDef, stmt: &Stmt) {
+    // Check for Meta class
+    if let Stmt::ClassDef(stmt_class) = stmt {
+        if stmt_class.name.as_str() == "Meta" {
+            for meta_stmt in stmt_class.body.iter() {
+                if let Stmt::Assign(assign) = meta_stmt
+                    && let Some(Expr::Name(name)) = assign.targets.first()
+                    && let Expr::BooleanLiteral(bool_lit) = assign.value.as_ref()
+                    && bool_lit.value
+                    && name.id == "abstract"
+                {
+                    model.mark_as_abstract();
+                    return;
+                }
+            }
+        }
+    }
+
+    // Extract relation
+    if let Some(relation) = extract_relation_from_stmt(stmt, &model.name) {
+        model.add_relation(relation);
+    }
+}
+
+/// Extract relation type from a field call
+fn get_relation_type(call: &ruff_python_ast::ExprCall) -> Option<RelationType> {
+    let name = match call.func.as_ref() {
+        // models.ForeignKey(...)
+        Expr::Attribute(attr) => attr.attr.id.as_str(),
+        // ForeignKey(...) - direct import
+        Expr::Name(name) => name.id.as_str(),
+        _ => return None,
+    };
+
+    RELATION_FIELDS
+        .iter()
+        .find(|(field_name, _)| *field_name == name)
+        .map(|(_, rel_type)| rel_type.clone())
+}
+
+/// Extract the target model from a relation field
+fn extract_target_model(call: &ruff_python_ast::ExprCall) -> Option<String> {
+    // First positional argument is the target model
+    let first_arg = call.arguments.args.first()?;
+
+    match first_arg {
+        // String reference: ForeignKey('ModelName') or ForeignKey('app.ModelName')
+        Expr::StringLiteral(s) => {
+            let value = s.value.to_string();
+            // Handle 'app.Model' format - take the model name
+            Some(value.split('.').next_back().unwrap_or(&value).to_string())
+        }
+        // Direct reference: ForeignKey(ModelName)
+        Expr::Name(name) => Some(name.id.to_string()),
+        // models.Model style isn't typically used for FK targets but handle it
+        Expr::Attribute(attr) => Some(attr.attr.id.to_string()),
+        _ => None,
+    }
+}
+
+/// Extract related_name from field kwargs
+fn extract_related_name(call: &ruff_python_ast::ExprCall) -> Option<String> {
+    for keyword in call.arguments.keywords.iter() {
+        if let Some(arg) = &keyword.arg
+            && arg.as_str() == "related_name"
+            && let Expr::StringLiteral(s) = &keyword.value
+        {
+            return Some(s.value.to_string());
+        }
+    }
+    None
+}
+
+/// Analyze an Stmt and capture the relation if it exists
+fn extract_relation_from_stmt(stmt: &Stmt, model_name: &str) -> Option<Relation> {
+    let Stmt::Assign(assign) = stmt else {
+        return None;
+    };
+
+    let Some(Expr::Name(target)) = assign.targets.first() else {
+        return None;
+    };
+    let field_name = target.id.to_string();
+
+    let Expr::Call(call) = assign.value.as_ref() else {
+        return None;
+    };
+
+    let relation_type = get_relation_type(call)?;
+    let target_model = extract_target_model(call)?;
+    let related_name = extract_related_name(call);
+
+    Some(Relation::new(
+        model_name,
+        field_name,
+        target_model,
+        relation_type,
+        related_name,
+    ))
 }
 
 impl<'a> Pass<'a> for ModelGraphPass<'a> {
@@ -164,6 +262,9 @@ impl<'a> Pass<'a> for ModelGraphPass<'a> {
         for stmt in &module.body {
             self.visit_stmt(stmt);
         }
+
+        self.resolve_potential_children();
+
         std::mem::take(&mut self.graph)
     }
 }
@@ -172,7 +273,13 @@ impl<'a> Visitor<'a> for ModelGraphPass<'a> {
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
         match stmt {
             Stmt::ClassDef(class) => {
-                if self.is_django_model(class.arguments.iter().flat_map(|args| args.args.iter())) {
+                let Some(ref args) = class.arguments else {
+                    return;
+                };
+
+                let args = &args.args;
+
+                if self.is_django_model(args.iter()) {
                     let line = self.line_number(class.range().start().to_usize());
                     self.current_model =
                         Some(ModelDef::new(class.name.to_string(), self.filename, line));
@@ -186,6 +293,9 @@ impl<'a> Visitor<'a> for ModelGraphPass<'a> {
                     if let Some(model) = self.current_model.take() {
                         self.graph.add_model(model);
                     }
+                } else if !args.is_empty() {
+                    // If inherit, track it
+                    self.insert_potential_model(&class);
                 }
             }
             _ => {
@@ -307,5 +417,72 @@ class Order(models.Model):
 
         // Should extract just "User" from "accounts.User"
         assert_eq!(order.relations[0].target_model, "User");
+    }
+
+    #[test]
+    fn detect_abstract_model() {
+        let source = r#"
+class Order(models.Model):
+    pass
+
+    class Meta:
+        abstract = True
+"#;
+        let graph = run_pass(source);
+        let order = graph.get("Order").unwrap();
+
+        assert!(order.is_abstract());
+    }
+
+    #[test]
+    fn detect_is_not_abstract_model() {
+        let source = r#"
+class Order(models.Model):
+    pass
+"#;
+        let graph = run_pass(source);
+        let order = graph.get("Order").unwrap();
+
+        assert!(!order.is_abstract());
+    }
+
+    #[test]
+    fn detect_inheritance() {
+        let source = r#"
+
+class User(models.Model):
+    pass
+
+class Seller(models.Model):
+    pass
+
+class Order(models.Model):
+    user = models.ForeignKey(User)
+
+    class Meta:
+        abstract = True
+
+class CreatedOrder(Order):
+    seller = models.ForeignKey(Seller)
+"#;
+        let graph = run_pass(source);
+        let order = graph.get("Order").unwrap();
+        let created_order = graph.get("CreatedOrder").unwrap();
+
+        assert!(order.is_abstract());
+        assert!(!created_order.is_abstract());
+        assert!(
+            created_order
+                .relations
+                .iter()
+                .any(|r| r.target_model == "User")
+        );
+
+        assert!(
+            created_order
+                .relations
+                .iter()
+                .any(|r| r.target_model == "Seller")
+        );
     }
 }

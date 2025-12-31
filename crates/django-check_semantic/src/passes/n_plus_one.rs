@@ -258,7 +258,6 @@ impl<'a> NPlusOnePass<'a> {
 
         if SAFE_NO_QS_METHODS.contains(&name) {
             return Some(SafeMethod {
-                name: name.to_string(),
                 prefetched_relations: Vec::new(),
             });
         }
@@ -273,7 +272,6 @@ impl<'a> NPlusOnePass<'a> {
                 .collect();
 
             safe_method = Some(SafeMethod {
-                name: name.to_string(),
                 prefetched_relations: parse_relation_fields(&fields),
             });
         }
