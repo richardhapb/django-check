@@ -53,7 +53,7 @@ impl Relation {
                     // prefix
                     RelationType::ManyToMany
                     | RelationType::ForeignKey
-                    | RelationType::GenericForeignKey => format!("{}_set", model_name.to_string()),
+                    | RelationType::GenericForeignKey => format!("{}_set", model_name),
                     // One to one use the model name directly
                     RelationType::OneToOne => model_name.to_string(),
                 }

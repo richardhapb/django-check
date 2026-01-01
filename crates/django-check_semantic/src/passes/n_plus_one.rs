@@ -187,27 +187,22 @@ impl<'a> NPlusOnePass<'a> {
                 Expr::Name(name) => {
                     if model.is_none()
                         && let Some(kind) = self.lookup(name.id.as_str())
+                        && let BindingKind::QuerySet(ctx) = kind
                     {
-                        match kind {
-                            BindingKind::QuerySet(ctx) => {
-                                let state = match ctx.state {
-                                    QuerySetState::Safe(_) => {
-                                        return BindingKind::QuerySet(QuerySetContext {
-                                            state: QuerySetState::Safe(safe_methods),
-                                            model: ctx.model.clone(),
-                                        });
-                                    }
-                                    QuerySetState::Unsafe => QuerySetState::Unsafe,
-                                };
+                        let state = match ctx.state {
+                            QuerySetState::Safe(_) => {
                                 return BindingKind::QuerySet(QuerySetContext {
-                                    state,
-                                    model: model.map(|m| m.name.clone()),
+                                    state: QuerySetState::Safe(safe_methods),
+                                    model: ctx.model.clone(),
                                 });
                             }
-
-                            _ => {}
+                            QuerySetState::Unsafe => QuerySetState::Unsafe,
                         };
-                    }
+                        return BindingKind::QuerySet(QuerySetContext {
+                            state,
+                            model: model.map(|m| m.name.clone()),
+                        });
+                    };
                     break;
                 }
                 _ => break,
@@ -372,7 +367,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         Expr::Name(iter_name) => {
                             if let Expr::Name(target) = for_stmt.target.as_ref() {
                                 if curr_qs.is_none() {
-                                    curr_qs = self.lookup(iter_name.id.as_str()).map(|k| k.clone());
+                                    curr_qs = self.lookup(iter_name.id.as_str()).cloned();
                                 }
 
                                 match &curr_qs {
@@ -478,46 +473,41 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             .iter()
                             .enumerate()
                             .find(|(_, a)| a.as_name_expr().is_some_and(|n| n.id == name.id))
+                        && let BindingKind::QuerySet(queryset_context) = bind
                     {
-                        match bind {
-                            BindingKind::QuerySet(queryset_context) => {
-                                match &queryset_context.state {
-                                    QuerySetState::Safe(safe_methods) => {
-                                        for a in f.args.iter() {
-                                            if a.idx == arg_idx
-                                                && a.attr_accesses.iter().any(|aa| {
-                                                    self.model_graph.is_relation(&a.model_name, aa)
-                                                        && !safe_methods.iter().any(|sm| {
-                                                            sm.prefetched_relations
-                                                                .iter()
-                                                                .any(|r| r == aa)
-                                                        })
+                        match &queryset_context.state {
+                            QuerySetState::Safe(safe_methods) => {
+                                for a in f.args.iter() {
+                                    if a.idx == arg_idx
+                                        && a.attr_accesses.iter().any(|aa| {
+                                            self.model_graph.is_relation(&a.model_name, aa)
+                                                && !safe_methods.iter().any(|sm| {
+                                                    sm.prefetched_relations.iter().any(|r| r == aa)
                                                 })
-                                            {
-                                                diagnostics.push(self.make_diagnostic(
-                                                    expr,
-                                                    &name.id,
-                                                    &a.var_name,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    QuerySetState::Unsafe => {
-                                        for a in f.args.iter() {
-                                            if a.attr_accesses.iter().any(|aa| {
-                                                self.model_graph.is_relation(&a.model_name, aa)
-                                            }) {
-                                                diagnostics.push(self.make_diagnostic(
-                                                    expr,
-                                                    &name.id,
-                                                    &a.var_name,
-                                                ));
-                                            }
-                                        }
+                                        })
+                                    {
+                                        diagnostics.push(self.make_diagnostic(
+                                            expr,
+                                            &name.id,
+                                            &a.var_name,
+                                        ));
                                     }
                                 }
                             }
-                            _ => {}
+                            QuerySetState::Unsafe => {
+                                for a in f.args.iter() {
+                                    if a.attr_accesses
+                                        .iter()
+                                        .any(|aa| self.model_graph.is_relation(&a.model_name, aa))
+                                    {
+                                        diagnostics.push(self.make_diagnostic(
+                                            expr,
+                                            &name.id,
+                                            &a.var_name,
+                                        ));
+                                    }
+                                }
+                            }
                         }
                     }
                 }

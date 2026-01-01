@@ -212,14 +212,14 @@ mod tests {
 def foo(qs: QuerySet[Bar]) -> None:
     pass
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(!functions.is_empty());
-        let function = functions.iter().next().unwrap();
+        let function = functions.first().unwrap();
         assert_eq!(function.name, "foo");
         assert!(!function.args.is_empty());
 
-        let arg = function.args.iter().next().unwrap();
+        let arg = function.args.first().unwrap();
         assert_eq!(arg.var_name, "qs");
         assert_eq!(arg.model_name, "Bar");
     }
@@ -230,14 +230,14 @@ def foo(qs: QuerySet[Bar]) -> None:
 def foo(qs: QuerySet[Bar], n: int, qs2: QuerySet[User]) -> None:
     pass
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(!functions.is_empty());
-        let function = functions.iter().next().unwrap();
+        let function = functions.first().unwrap();
         assert_eq!(function.name, "foo");
         assert!(!function.args.is_empty());
 
-        let arg1 = function.args.iter().next().unwrap();
+        let arg1 = function.args.first().unwrap();
         let arg2 = function.args.iter().last().unwrap();
 
         assert_eq!(arg1.var_name, "qs");
@@ -254,7 +254,7 @@ def foo(qs: QuerySet[Bar], n: int, qs2: QuerySet[User]) -> None:
 def foo(n: int, s: str) -> None:
     pass
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(functions.is_empty());
     }
@@ -267,14 +267,14 @@ from bar.models import Bar as BarModel
 def foo(qs: QuerySet[BarModel]) -> None:
     pass
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(!functions.is_empty());
-        let function = functions.iter().next().unwrap();
+        let function = functions.first().unwrap();
         assert_eq!(function.name, "foo");
         assert!(!function.args.is_empty());
 
-        let arg = function.args.iter().next().unwrap();
+        let arg = function.args.first().unwrap();
         assert_eq!(arg.var_name, "qs");
         assert_eq!(arg.model_name, "Bar");
     }
@@ -286,14 +286,14 @@ def foo(qs: QuerySet[Bar]) -> None:
     for q in qs:
        print(q.user)
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(!functions.is_empty());
-        let function = functions.iter().next().unwrap();
+        let function = functions.first().unwrap();
         assert_eq!(function.name, "foo");
         assert!(!function.args.is_empty());
 
-        let arg = function.args.iter().next().unwrap();
+        let arg = function.args.first().unwrap();
         assert_eq!(arg.var_name, "qs");
         assert_eq!(arg.model_name, "Bar");
         assert_eq!(arg.idx, 0);
@@ -311,10 +311,10 @@ def foo(qs: QuerySet[Bar], qs2: QuerySet[Bar2]) -> None:
         for q2 in qs2:
             print(q2.user)
         "#;
-        let functions = run_pass(&source);
+        let functions = run_pass(source);
 
         assert!(!functions.is_empty());
-        let function = functions.iter().next().unwrap();
+        let function = functions.first().unwrap();
         assert_eq!(function.name, "foo");
         assert!(!function.args.is_empty());
 

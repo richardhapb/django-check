@@ -144,7 +144,7 @@ impl<'a> ModelGraphPass<'a> {
         for arg in args {
             if let Some(name_expr) = arg.as_name_expr() {
                 let name = name_expr.id.as_str();
-                if self.graph.models().any(|m| &m.name == name) {
+                if self.graph.models().any(|m| m.name == name) {
                     return Some(name);
                 }
             }
@@ -156,18 +156,18 @@ impl<'a> ModelGraphPass<'a> {
 /// Process the body of a class, capturing if it is abstract or a django relation
 fn process_class_body_stmt_for_model(model: &mut ModelDef, stmt: &Stmt) {
     // Check for Meta class
-    if let Stmt::ClassDef(stmt_class) = stmt {
-        if stmt_class.name.as_str() == "Meta" {
-            for meta_stmt in stmt_class.body.iter() {
-                if let Stmt::Assign(assign) = meta_stmt
-                    && let Some(Expr::Name(name)) = assign.targets.first()
-                    && let Expr::BooleanLiteral(bool_lit) = assign.value.as_ref()
-                    && bool_lit.value
-                    && name.id == "abstract"
-                {
-                    model.mark_as_abstract();
-                    return;
-                }
+    if let Stmt::ClassDef(stmt_class) = stmt
+        && stmt_class.name.as_str() == "Meta"
+    {
+        for meta_stmt in stmt_class.body.iter() {
+            if let Stmt::Assign(assign) = meta_stmt
+                && let Some(Expr::Name(name)) = assign.targets.first()
+                && let Expr::BooleanLiteral(bool_lit) = assign.value.as_ref()
+                && bool_lit.value
+                && name.id == "abstract"
+            {
+                model.mark_as_abstract();
+                return;
             }
         }
     }
@@ -295,7 +295,7 @@ impl<'a> Visitor<'a> for ModelGraphPass<'a> {
                     }
                 } else if !args.is_empty() {
                     // If inherit, track it
-                    self.insert_potential_model(&class);
+                    self.insert_potential_model(class);
                 }
             }
             _ => {
