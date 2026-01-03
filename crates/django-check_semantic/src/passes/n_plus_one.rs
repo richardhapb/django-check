@@ -116,8 +116,18 @@ impl<'a> NPlusOnePass<'a> {
         loop {
             match curr_expr {
                 Expr::Call(call) => {
+                    // Collect safe methods
                     if let Some(safe_method) = self.get_safe_method(call) {
                         safe_methods.push(safe_method);
+                    }
+
+                    if let Some(name) = call.func.as_name_expr()
+                        && name.id == "list"
+                    {
+                        // Capture when the queryset is wrapped in a list,
+                        // like list(User.objects.all())
+                        curr_expr = call.arguments.args.first().unwrap_or(&call.func);
+                        continue;
                     }
 
                     curr_expr = &call.func;
@@ -156,15 +166,12 @@ impl<'a> NPlusOnePass<'a> {
                                 {
                                     model = self.try_get_related_model(&chain, &related_model.name);
 
-                                    // Skip if the model was found in the last step
+                                    // Skip if the model has been found in the last step
                                     if model.is_some() {
                                         continue;
                                     }
 
-                                    model = self
-                                        .model_graph
-                                        .get_relation(base, attr.attr.id.as_str())
-                                        .and_then(|m| self.model_graph.get(m));
+                                    return captured.clone();
                                 }
                             }
                             BindingKind::ModelInstance(instance) => {
@@ -244,7 +251,7 @@ impl<'a> NPlusOnePass<'a> {
 
     fn get_safe_method(&self, call: &ruff_python_ast::ExprCall) -> Option<SafeMethod> {
         const SAFE_QS_METHODS: [&str; 2] = ["select_related", "prefetch_related"];
-        const SAFE_NO_QS_METHODS: [&str; 3] = ["values", "values_list", "iterator"];
+        const SAFE_NO_QS_METHODS: [&str; 2] = ["values", "values_list"];
 
         let mut safe_method = None;
 
@@ -358,12 +365,12 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
             Stmt::For(for_stmt) => {
                 let mut pushed_loop = false;
 
-                let mut iter = for_stmt.iter.as_ref();
+                let mut expr = for_stmt.iter.as_ref();
                 let mut curr_qs = None;
                 let mut is_call = false;
 
                 loop {
-                    match iter {
+                    match expr {
                         Expr::Name(iter_name) => {
                             if let Expr::Name(target) = for_stmt.target.as_ref() {
                                 if curr_qs.is_none() {
@@ -401,8 +408,8 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         Expr::Call(call) => {
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders.all(): ... where user is an instance of User
-                            curr_qs = Some(self.classify_expr(&for_stmt.iter));
-                            iter = &call.func;
+                            curr_qs = Some(self.classify_expr(expr));
+                            expr = &call.func;
                             is_call = true;
                         }
                         Expr::Attribute(attr) => {
@@ -410,10 +417,10 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             // `for order in user.orders: ... where user is an instance of User
                             // if expr is a Call, that can be in the form user.orders.filter(..)
                             if !is_call {
-                                curr_qs = Some(self.classify_expr(&for_stmt.iter));
+                                curr_qs = Some(self.classify_expr(expr));
                             }
 
-                            iter = &attr.value
+                            expr = &attr.value
                         }
                         _ => break,
                     }
@@ -459,6 +466,9 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
             }
             Expr::Call(call) => {
                 let mut diagnostics = Vec::new();
+                // Detect if a query set is passed to a function
+                // and the function expect a queryset, also the function
+                // expects a queryset in that parameter
                 for arg in call.arguments.args.iter() {
                     if let Expr::Name(name) = arg
                         && let Some(bind) = self.lookup(&name.id)
@@ -476,6 +486,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         && let BindingKind::QuerySet(queryset_context) = bind
                     {
                         match &queryset_context.state {
+                            // If it is safe, look for a no prefetched relation
                             QuerySetState::Safe(safe_methods) => {
                                 for a in f.args.iter() {
                                     if a.idx == arg_idx
@@ -494,6 +505,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                                     }
                                 }
                             }
+                            // If it is unsafe, check for anu relation accesed inside the function
                             QuerySetState::Unsafe => {
                                 for a in f.args.iter() {
                                     if a.attr_accesses
@@ -793,6 +805,26 @@ foo(tier1)
         assert!(diags.is_empty());
     }
 
+    //     #[test]
+    //     fn detect_traceback_using_iterable() {
+    //         let source = r#"
+    // class TheoAnalysis(models.Model):
+    //     tier = models.CharField(max_length=11, choices=Tiers.choices)
+    //
+    // class Tier1(models.Model):
+    //     analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
+    //
+    // def foo(t1: Iterable[Tier1]):
+    //     for t in t1:
+    //         print(t.analysis)
+    //
+    // tier1 = Tier1.objects.all()
+    // foo(tier1)
+    //     "#;
+    //         let diags = run_pass(source);
+    //         assert_eq!(diags.len(), 1);
+    //     }
+    //
     #[test]
     fn detect_n1_after_get_object_or_404() {
         let source = r#"
@@ -826,6 +858,48 @@ user = User.objects.get(id=1)
 for order in user.orders.all():
     print(order)  # Should NOT warn (no relation access)
     print(order.user)  # Should warn (N+1)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    //     #[test]
+    //     fn detect_n1_nested_relation_access_in_for() {
+    //         let source = r#"
+    // class User(Model):
+    //     pass
+    //
+    // class Method(Model):
+    //     pass
+    //
+    // class Payment(Model):
+    //     user = models.ForeignKey(User, related_name="payments")
+    //     method = models.ForeignKey(Method, related_name="payments")
+    //
+    // class Order(Model):
+    //     users = models.ManyToManyField(User, related_name="orders")
+    //
+    // orders = Order.objects.all()
+    // for user in orders.users:
+    //     for payment in user.payments:
+    //         print(payment.method)
+    //     "#;
+    //         let diags = run_pass(source);
+    //         assert_eq!(diags.len(), 1);
+    //     }
+
+    #[test]
+    fn detect_n1_in_list() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+orders = list(Order.objects.all())
+for order in orders:
+    print(order.user)
     "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
@@ -866,4 +940,54 @@ for order in user.orders.filter(id__lt=10):
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
     }
+
+    #[test]
+    fn detect_n1_using_iterator() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+orders = Order.objects.all()
+for order in orders.iterator():
+    print(order.user)
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn no_detect_valid_n1_using_iterator() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+orders = Order.objects.select_related("user").all()
+for order in orders.iterator():
+    print(order.user)
+    "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    //     #[test]
+    //     fn detect_n1_using_comprehension() {
+    //         let source = r#"
+    // class User(Model):
+    //     pass
+    //
+    // class Order(Model):
+    //     user = models.ForeignKey(User, related_name="orders")
+    //
+    // orders = Order.objects.all()
+    // print([order.user for order in orders])
+    //     "#;
+    //         let diags = run_pass(source);
+    //         assert_eq!(diags.len(), 1);
+    //     }
 }

@@ -14,20 +14,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = current_dir().expect("should get the cwd");
     let parser = Parser::new();
 
+    let model_graph = parser.extract_model_graph(&cwd)?;
+    let functions = parser.extract_functions(&cwd)?;
+
     let cli = Cli::parse();
 
     match cli.cmd {
         Cmd::Check => {
             initialize_logger(false);
-            let model_graph = parser.extract_model_graph(&cwd)?;
-            let functions = parser.extract_functions(&cwd)?;
             if let Err(e) = parser.analyze_directory(&cwd, &model_graph, &functions) {
                 eprintln!("Error: {}", e);
             }
         }
         Cmd::Server => {
             initialize_logger(true);
-            serve(&cwd).await;
+            serve(&cwd, model_graph, functions).await;
         }
     }
 

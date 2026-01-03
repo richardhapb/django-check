@@ -361,7 +361,7 @@ class Order(models.Model):
         let product_rel = &order.relations[1];
         assert_eq!(product_rel.field_name, "product");
         assert_eq!(product_rel.target_model, "Product");
-        assert_eq!(product_rel.related_name(), "orders");
+        assert_eq!(product_rel.related_name("Order"), "orders");
     }
 
     #[test]
@@ -483,6 +483,37 @@ class CreatedOrder(Order):
                 .relations
                 .iter()
                 .any(|r| r.target_model == "Seller")
+        );
+    }
+
+    #[test]
+    fn inherited_related_name() {
+        let source = r#"
+class User(models.Model):
+    pass
+
+class Seller(models.Model):
+    pass
+
+class Order(models.Model):
+    user = models.ForeignKey(User, related_name="%(class)ss")
+
+    class Meta:
+        abstract = True
+
+class CreatedOrder(Order):
+    seller = models.ForeignKey(Seller)
+"#;
+
+        let graph = run_pass(source);
+        let created_order = graph.get("CreatedOrder").unwrap();
+
+        assert!(
+            created_order
+                .relations
+                .iter()
+                .any(|r| r.target_model == "User"
+                    && r.related_name("CreatedOrder") == "createdorders")
         );
     }
 }

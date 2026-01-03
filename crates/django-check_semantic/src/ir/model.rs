@@ -34,8 +34,9 @@ impl Relation {
         }
     }
 
-    pub fn related_name(&self) -> &str {
-        &self.related_name
+    pub fn related_name(&self, model_name: &str) -> String {
+        self.related_name
+            .replace("%(class)s", &model_name.to_lowercase())
     }
 
     fn resolve_related_name(
@@ -46,7 +47,7 @@ impl Relation {
         let model_name = model_name.to_lowercase();
         match related_name.as_ref() {
             // django uses %(class)s to replace dynamically the class name
-            Some(related_name) => related_name.replace("%(class)s", &model_name),
+            Some(related_name) => related_name.clone(),
             None => {
                 match relation_type {
                     // ManyTo relation by default uses model_name in lowercase with `_set` as a
@@ -128,16 +129,18 @@ impl ModelGraph {
     }
 
     pub fn is_relation(&self, model_name: &str, related_name: &str) -> bool {
-        self.get_model_relations(model_name).contains(&related_name)
+        self.get_model_relations(model_name)
+            .iter()
+            .any(|r| r == related_name)
     }
 
-    pub fn get_model_relations(&self, model_name: &str) -> Vec<&str> {
+    pub fn get_model_relations(&self, model_name: &str) -> Vec<String> {
         let mut result = Vec::new();
 
         // Forward: fields on this model pointing to others
         if let Some(model) = self.models.get(model_name) {
             for r in &model.relations {
-                result.push(r.field_name.as_str());
+                result.push(r.field_name.clone());
             }
         }
 
@@ -145,7 +148,7 @@ impl ModelGraph {
         for m in self.dependents(model_name) {
             for r in &m.relations {
                 if r.target_model == model_name {
-                    result.push(r.related_name.as_str());
+                    result.push(r.related_name(&m.name));
                 }
             }
         }
@@ -166,7 +169,7 @@ impl ModelGraph {
         // Reverse: related_names from models pointing to this one
         for m in self.dependents(model_name) {
             for r in &m.relations {
-                if r.target_model == model_name && r.related_name == related_name {
+                if r.target_model == model_name && r.related_name(&m.name) == related_name {
                     return Some(m.name.as_str());
                 }
             }
@@ -276,7 +279,7 @@ mod tests {
             RelationType::ForeignKey,
             None,
         );
-        assert_eq!(rel.related_name(), "user_set");
+        assert_eq!(rel.related_name("User"), "user_set");
     }
 
     #[test]
@@ -288,7 +291,7 @@ mod tests {
             RelationType::OneToOne,
             None,
         );
-        assert_eq!(rel.related_name(), "user");
+        assert_eq!(rel.related_name("User"), "user");
     }
 
     #[test]
@@ -300,7 +303,7 @@ mod tests {
             RelationType::OneToOne,
             Some("users".into()),
         );
-        assert_eq!(rel.related_name(), "users");
+        assert_eq!(rel.related_name("User"), "users");
     }
 
     #[test]
@@ -312,6 +315,6 @@ mod tests {
             RelationType::OneToOne,
             Some("%(class)s_elements".into()),
         );
-        assert_eq!(rel.related_name(), "user_elements");
+        assert_eq!(rel.related_name("User"), "user_elements");
     }
 }

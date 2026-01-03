@@ -112,7 +112,7 @@ impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
                     if let Some(anot) = arg.parameter.annotation()
                         && let Some(subscript) = anot.as_subscript_expr()
                         && let Expr::Name(name) = subscript.value.as_ref()
-                        && name.id.contains("QuerySet")
+                        && is_iterable_type(&name.id)
                         && let Expr::Name(sl) = subscript.slice.as_ref()
                     {
                         let model_name = sl.id.as_str();
@@ -192,6 +192,10 @@ impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
 
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
+}
+
+fn is_iterable_type(t: &str) -> bool {
+    ["queryset", "list", "tuple", "iterable", "sequence"].contains(&t.to_lowercase().as_str())
 }
 
 #[cfg(test)]

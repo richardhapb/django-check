@@ -7,7 +7,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 #[derive(Debug, Clone)]
 struct Backend {
@@ -130,18 +130,12 @@ fn build_server_info() -> ServerInfo {
     }
 }
 
-pub async fn serve(cwd: &Path) {
+pub async fn serve(cwd: &Path, model_graph: ModelGraph, functions: Vec<QueryFunction>) {
+    trace!(?model_graph);
+
     info!("Initializing LSP");
 
     let parser = Parser::new();
-    let model_graph = parser.extract_model_graph(cwd).unwrap_or_else(|e| {
-        error!(%e, "parse model graph");
-        std::process::exit(1);
-    });
-    let functions = parser.extract_functions(cwd).unwrap_or_else(|e| {
-        error!(%e, "parse functions");
-        std::process::exit(1);
-    });
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
