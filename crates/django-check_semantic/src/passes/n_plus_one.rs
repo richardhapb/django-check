@@ -7,25 +7,44 @@
 
 use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
 use ruff_text_size::Ranged;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 
 use crate::diagnostic::NPlusOneDiagnostic;
-use crate::ir::binding::{BindingKind, QuerySetState};
+use crate::ir::binding::{DjangoSymbol, DjangoSymbolId, DjangoSymbolKind, QuerySetState};
 use crate::ir::model::{ModelDef, ModelGraph};
 use crate::passes::extract_attribute_chain;
 use crate::passes::{Pass, functions::QueryFunction};
 
 const DIAGNOSTIC_CODE: &str = "N+1";
 
+#[derive(Debug)]
 pub(crate) struct ScopeManager {
     scopes: Vec<ScopeState>,
+    qs_id: Cell<u32>,
+    dj_symbols: RefCell<HashSet<DjangoSymbol>>,
 }
 
 impl ScopeManager {
     pub fn new() -> Self {
         Self {
             scopes: vec![ScopeState::new()],
+            qs_id: Cell::new(0),
+            dj_symbols: RefCell::new(HashSet::new()),
         }
+    }
+
+    fn new_sym(&self, kind: DjangoSymbolKind) -> DjangoSymbolId {
+        let sym = DjangoSymbol::new(self.new_qs_id(), kind);
+        let id = *sym.id();
+        self.dj_symbols.borrow_mut().insert(sym);
+        id
+    }
+
+    fn new_qs_id(&self) -> DjangoSymbolId {
+        let id = self.qs_id.get();
+        self.qs_id.set(id + 1);
+        DjangoSymbolId::new(id)
     }
 
     fn push_scope(&mut self) {
@@ -38,20 +57,28 @@ impl ScopeManager {
         }
     }
 
-    fn insert_in_current_scope(&mut self, name: String, kind: BindingKind) {
+    fn insert_in_current_scope(&mut self, name: String, id: DjangoSymbolId) {
         self.scopes
             .iter_mut()
             .last()
-            .map(|s| s.symbols.insert(name, kind));
+            .map(|s| s.symbols.insert(name, id));
     }
 
-    fn lookup<'a>(&'a self, name: &str) -> Option<&'a BindingKind> {
+    fn lookup(&self, name: &str) -> Option<DjangoSymbol> {
         for scope in self.scopes.iter().rev() {
-            if let Some(kind) = scope.symbols.get(name) {
-                return Some(kind);
+            if let Some(id) = scope.symbols.get(name) {
+                return self.django_symbol(id);
             }
         }
         None
+    }
+
+    fn django_symbol(&self, id: &DjangoSymbolId) -> Option<DjangoSymbol> {
+        self.dj_symbols
+            .borrow()
+            .iter()
+            .find(|&qs| qs.id() == id)
+            .cloned()
     }
 }
 
@@ -63,7 +90,7 @@ struct LoopContext {
 
 #[derive(Debug)]
 struct ScopeState {
-    symbols: HashMap<String, BindingKind>,
+    symbols: HashMap<String, DjangoSymbolId>,
 }
 
 impl ScopeState {
@@ -74,6 +101,7 @@ impl ScopeState {
     }
 }
 
+#[derive(Debug)]
 pub struct QuerySetClassifier<'a> {
     scope_manager: &'a ScopeManager,
 }
@@ -83,7 +111,7 @@ impl<'a> QuerySetClassifier<'a> {
         Self { scope_manager }
     }
 
-    fn classify_expr(&self, expr: &Expr, model_graph: &ModelGraph) -> BindingKind {
+    fn classify_expr(&self, expr: &Expr, model_graph: &ModelGraph) -> DjangoSymbolId {
         let mut curr_expr = expr;
         let mut model = None;
 
@@ -93,7 +121,9 @@ impl<'a> QuerySetClassifier<'a> {
              // First arg is the model class
             && let Some(Expr::Name(model_name)) = call.arguments.args.first()
         {
-            return BindingKind::ModelInstance(model_name.id.to_string());
+            return self
+                .scope_manager
+                .new_sym(DjangoSymbolKind::ModelInstance(model_name.id.to_string()));
         }
 
         let mut calls = Vec::new();
@@ -138,8 +168,8 @@ impl<'a> QuerySetClassifier<'a> {
                     if model.is_none()
                         && let Some(captured) = self.scope_manager.lookup(base)
                     {
-                        match captured {
-                            BindingKind::QuerySet(state) => {
+                        match &captured.kind {
+                            DjangoSymbolKind::QuerySet(state) => {
                                 let mut state = state.clone();
                                 calls.iter().for_each(|c| state.apply_call(c));
 
@@ -157,10 +187,10 @@ impl<'a> QuerySetClassifier<'a> {
                                         continue;
                                     }
 
-                                    return captured.clone();
+                                    return self.scope_manager.new_sym(captured.kind.clone());
                                 }
                             }
-                            BindingKind::ModelInstance(instance) => {
+                            DjangoSymbolKind::ModelInstance(instance) => {
                                 model = self.try_get_related_model(&chain, instance, model_graph);
 
                                 // Skip if the model was found in the last step
@@ -178,29 +208,32 @@ impl<'a> QuerySetClassifier<'a> {
                 }
                 Expr::Name(name) => {
                     if model.is_none()
-                        && let Some(kind) = self.scope_manager.lookup(name.id.as_str())
-                        && let BindingKind::QuerySet(state) = kind
+                        && let Some(dj_sym) = self.scope_manager.lookup(name.id.as_str())
+                        && let DjangoSymbolKind::QuerySet(state) = &dj_sym.kind
                     {
                         let mut state = state.clone();
                         calls.iter().for_each(|c| state.apply_call(c));
-                        return BindingKind::QuerySet(state);
+                        return self
+                            .scope_manager
+                            .new_sym(DjangoSymbolKind::QuerySet(state));
                     };
 
                     break;
                 }
-                _ => return BindingKind::Unknown,
+                _ => break,
             }
         }
 
         let Some(model) = model else {
-            return BindingKind::Unknown;
+            return self.scope_manager.new_sym(DjangoSymbolKind::Unknown);
         };
 
         let mut state = QuerySetState::new(model.name.clone());
 
         calls.iter().for_each(|c| state.apply_call(c));
 
-        BindingKind::QuerySet(state)
+        self.scope_manager
+            .new_sym(DjangoSymbolKind::QuerySet(state))
     }
 
     fn try_get_related_model(
@@ -255,10 +288,10 @@ impl<'a> NPlusOnePass<'a> {
 
     fn record_assignment(&mut self, target: &'a Expr, value: &'a Expr) {
         let classifier = QuerySetClassifier::new(&self.scope_manager);
-        let kind = classifier.classify_expr(value, self.model_graph);
+        let sym_id = classifier.classify_expr(value, self.model_graph);
         if let Expr::Name(name) = target {
             self.scope_manager
-                .insert_in_current_scope(name.id.to_string(), kind);
+                .insert_in_current_scope(name.id.to_string(), sym_id);
         }
     }
 
@@ -342,27 +375,31 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 let mut pushed_loop = false;
 
                 let mut expr = for_stmt.iter.as_ref();
-                let mut curr_qs = None;
+                let mut curr_sym_id = None;
                 let mut is_call = false;
 
                 loop {
                     match expr {
                         Expr::Name(iter_name) => {
                             if let Expr::Name(target) = for_stmt.target.as_ref() {
-                                if curr_qs.is_none() {
-                                    curr_qs =
-                                        self.scope_manager.lookup(iter_name.id.as_str()).cloned();
+                                if curr_sym_id.is_none() {
+                                    curr_sym_id = self
+                                        .scope_manager
+                                        .lookup(iter_name.id.as_str())
+                                        .map(|s| *s.id());
                                 }
 
-                                match &curr_qs {
-                                    Some(BindingKind::QuerySet(context)) => {
+                                match curr_sym_id.and_then(|id| {
+                                    self.scope_manager.django_symbol(&id).map(|ds| ds.kind)
+                                }) {
+                                    Some(DjangoSymbolKind::QuerySet(context)) => {
                                         self.active_loops.push(LoopContext {
                                             loop_var: target.id.to_string(),
                                             queryset_state: context.clone(),
                                         });
                                         pushed_loop = true;
                                     }
-                                    Some(BindingKind::ModelInstance(instance)) => {
+                                    Some(DjangoSymbolKind::ModelInstance(instance)) => {
                                         self.active_loops.push(LoopContext {
                                             loop_var: target.id.to_string(),
                                             queryset_state: QuerySetState::new(instance.clone()),
@@ -381,7 +418,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             let classifier = QuerySetClassifier::new(&self.scope_manager);
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders.all(): ... where user is an instance of User
-                            curr_qs = Some(classifier.classify_expr(expr, self.model_graph));
+                            curr_sym_id = Some(classifier.classify_expr(expr, self.model_graph));
                             expr = &call.func;
                             is_call = true;
                         }
@@ -391,7 +428,8 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             // `for order in user.orders: ... where user is an instance of User
                             // if expr is a Call, that can be in the form user.orders.filter(..)
                             if !is_call {
-                                curr_qs = Some(classifier.classify_expr(expr, self.model_graph));
+                                curr_sym_id =
+                                    Some(classifier.classify_expr(expr, self.model_graph));
                             }
 
                             expr = &attr.value
@@ -456,7 +494,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             .iter()
                             .enumerate()
                             .find(|(_, a)| a.as_name_expr().is_some_and(|n| n.id == name.id))
-                        && let BindingKind::QuerySet(state) = bind
+                        && let DjangoSymbolKind::QuerySet(state) = &bind.kind
                     {
                         // If it is safe, look for a no prefetched relation
                         for a in f.args.iter() {

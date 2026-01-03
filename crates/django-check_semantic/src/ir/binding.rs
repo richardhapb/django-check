@@ -1,10 +1,19 @@
 //! Binding-level intermediate representation for tracking variable states.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, hash::Hash};
 
 use ruff_python_ast::{Expr, ExprCall};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
+pub struct DjangoSymbolId(u32);
+
+impl DjangoSymbolId {
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuerySetState {
     /// The name of the model
     pub model_name: String,
@@ -57,10 +66,37 @@ impl QuerySetState {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum BindingKind {
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct DjangoSymbol {
+    /// Id that identifies the QuerySet
+    id: DjangoSymbolId,
+    /// Kind of django symbol
+    pub kind: DjangoSymbolKind,
+}
+
+impl Hash for DjangoSymbol {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl DjangoSymbol {
+    pub fn new(id: DjangoSymbolId, kind: DjangoSymbolKind) -> Self {
+        Self { id, kind }
+    }
+
+    pub fn id(&self) -> &DjangoSymbolId {
+        &self.id
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum DjangoSymbolKind {
+    /// A `QuerySet` instance
     QuerySet(QuerySetState),
+    /// A Model instance
     ModelInstance(String),
+    /// Unknown symbol
     Unknown,
 }
 
