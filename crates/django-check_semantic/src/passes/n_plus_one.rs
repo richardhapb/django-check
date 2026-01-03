@@ -17,6 +17,44 @@ use crate::passes::{Pass, functions::QueryFunction};
 
 const DIAGNOSTIC_CODE: &str = "N+1";
 
+pub(crate) struct ScopeManager {
+    scopes: Vec<ScopeState>,
+}
+
+impl ScopeManager {
+    pub fn new() -> Self {
+        Self {
+            scopes: vec![ScopeState::new()],
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(ScopeState::new());
+    }
+
+    fn pop_scope(&mut self) {
+        if self.scopes.len() > 1 {
+            self.scopes.pop();
+        }
+    }
+
+    fn insert_in_current_scope(&mut self, name: String, kind: BindingKind) {
+        self.scopes
+            .iter_mut()
+            .last()
+            .map(|s| s.symbols.insert(name, kind));
+    }
+
+    fn lookup<'a>(&'a self, name: &str) -> Option<&'a BindingKind> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(kind) = scope.symbols.get(name) {
+                return Some(kind);
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LoopContext {
     loop_var: String,
@@ -36,15 +74,16 @@ impl ScopeState {
     }
 }
 
-pub struct QuerySetClassifier;
+pub struct QuerySetClassifier<'a> {
+    scope_manager: &'a ScopeManager,
+}
 
-impl QuerySetClassifier {
-    fn classify_expr(
-        &self,
-        expr: &Expr,
-        model_graph: &ModelGraph,
-        scopes: &[ScopeState],
-    ) -> BindingKind {
+impl<'a> QuerySetClassifier<'a> {
+    pub fn new(scope_manager: &'a ScopeManager) -> Self {
+        Self { scope_manager }
+    }
+
+    fn classify_expr(&self, expr: &Expr, model_graph: &ModelGraph) -> BindingKind {
         let mut curr_expr = expr;
         let mut model = None;
 
@@ -97,7 +136,7 @@ impl QuerySetClassifier {
                     }
 
                     if model.is_none()
-                        && let Some(captured) = lookup(base, scopes)
+                        && let Some(captured) = self.scope_manager.lookup(base)
                     {
                         match captured {
                             BindingKind::QuerySet(state) => {
@@ -139,7 +178,7 @@ impl QuerySetClassifier {
                 }
                 Expr::Name(name) => {
                     if model.is_none()
-                        && let Some(kind) = lookup(name.id.as_str(), scopes)
+                        && let Some(kind) = self.scope_manager.lookup(name.id.as_str())
                         && let BindingKind::QuerySet(state) = kind
                     {
                         let mut state = state.clone();
@@ -164,7 +203,7 @@ impl QuerySetClassifier {
         BindingKind::QuerySet(state)
     }
 
-    fn try_get_related_model<'a>(
+    fn try_get_related_model(
         &self,
         chain: &[&str],
         model_name: &str,
@@ -189,12 +228,11 @@ impl QuerySetClassifier {
 pub struct NPlusOnePass<'a> {
     filename: &'a str,
     source: &'a str,
-    scopes: Vec<ScopeState>,
+    scope_manager: ScopeManager,
     model_graph: &'a ModelGraph,
     active_loops: Vec<LoopContext>,
     functions: &'a [QueryFunction],
     diagnostics: Vec<NPlusOneDiagnostic>,
-    classifier: QuerySetClassifier,
 }
 
 impl<'a> NPlusOnePass<'a> {
@@ -208,38 +246,19 @@ impl<'a> NPlusOnePass<'a> {
             filename,
             source,
             model_graph,
-            scopes: vec![ScopeState::new()],
+            scope_manager: ScopeManager::new(),
             active_loops: Vec::new(),
             diagnostics: Vec::new(),
             functions,
-            classifier: QuerySetClassifier,
-        }
-    }
-
-    fn current_scope_mut(&mut self) -> &mut ScopeState {
-        self.scopes
-            .last_mut()
-            .expect("scope stack should never be empty")
-    }
-
-    fn push_scope(&mut self) {
-        self.scopes.push(ScopeState::new());
-    }
-
-    fn pop_scope(&mut self) {
-        if self.scopes.len() > 1 {
-            self.scopes.pop();
         }
     }
 
     fn record_assignment(&mut self, target: &'a Expr, value: &'a Expr) {
-        let kind = self
-            .classifier
-            .classify_expr(value, self.model_graph, &self.scopes);
+        let classifier = QuerySetClassifier::new(&self.scope_manager);
+        let kind = classifier.classify_expr(value, self.model_graph);
         if let Expr::Name(name) = target {
-            self.current_scope_mut()
-                .symbols
-                .insert(name.id.to_string(), kind);
+            self.scope_manager
+                .insert_in_current_scope(name.id.to_string(), kind);
         }
     }
 
@@ -331,7 +350,8 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         Expr::Name(iter_name) => {
                             if let Expr::Name(target) = for_stmt.target.as_ref() {
                                 if curr_qs.is_none() {
-                                    curr_qs = lookup(iter_name.id.as_str(), &self.scopes).cloned();
+                                    curr_qs =
+                                        self.scope_manager.lookup(iter_name.id.as_str()).cloned();
                                 }
 
                                 match &curr_qs {
@@ -358,26 +378,20 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         // are temporary values in the `for` and we call walk_stmt here, then
                         // drop the classification is ok
                         Expr::Call(call) => {
+                            let classifier = QuerySetClassifier::new(&self.scope_manager);
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders.all(): ... where user is an instance of User
-                            curr_qs = Some(self.classifier.classify_expr(
-                                expr,
-                                self.model_graph,
-                                &self.scopes,
-                            ));
+                            curr_qs = Some(classifier.classify_expr(expr, self.model_graph));
                             expr = &call.func;
                             is_call = true;
                         }
                         Expr::Attribute(attr) => {
+                            let classifier = QuerySetClassifier::new(&self.scope_manager);
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders: ... where user is an instance of User
                             // if expr is a Call, that can be in the form user.orders.filter(..)
                             if !is_call {
-                                curr_qs = Some(self.classifier.classify_expr(
-                                    expr,
-                                    self.model_graph,
-                                    &self.scopes,
-                                ));
+                                curr_qs = Some(classifier.classify_expr(expr, self.model_graph));
                             }
 
                             expr = &attr.value
@@ -393,9 +407,9 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 }
             }
             Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-                self.push_scope();
+                self.scope_manager.push_scope();
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
-                self.pop_scope();
+                self.scope_manager.pop_scope();
             }
             _ => ruff_python_ast::visitor::walk_stmt(self, stmt),
         }
@@ -430,7 +444,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 // expects a queryset in that parameter
                 for arg in call.arguments.args.iter() {
                     if let Expr::Name(name) = arg
-                        && let Some(bind) = lookup(&name.id, &self.scopes)
+                        && let Some(bind) = self.scope_manager.lookup(&name.id)
                         && let Some(f) = self.functions.iter().find(|f| {
                             call.func
                                 .as_name_expr()
@@ -466,15 +480,6 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
         }
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
-}
-
-fn lookup<'a>(name: &str, scopes: &'a [ScopeState]) -> Option<&'a BindingKind> {
-    for scope in scopes.iter().rev() {
-        if let Some(kind) = scope.symbols.get(name) {
-            return Some(kind);
-        }
-    }
-    None
 }
 
 #[cfg(test)]
