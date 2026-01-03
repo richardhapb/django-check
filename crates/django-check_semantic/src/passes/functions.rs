@@ -1,4 +1,4 @@
-use crate::passes::Pass;
+use crate::passes::{Pass, extract_attribute_chain};
 use ruff_python_ast::{Expr, ModModule, Stmt, visitor::Visitor};
 use std::{
     collections::{HashMap, HashSet},
@@ -176,7 +176,7 @@ impl<'a> Visitor<'a> for QueryFunctionPass<'a> {
 
     fn visit_expr(&mut self, expr: &'a Expr) {
         if let Expr::Attribute(attr) = expr {
-            let (base_name, attr_chain) = self.extract_attribute_chain(attr);
+            let (base_name, attr_chain) = extract_attribute_chain(attr);
 
             for ctx in self.active_loops.iter() {
                 if ctx.loop_var != base_name {

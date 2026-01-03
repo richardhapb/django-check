@@ -10,10 +10,9 @@ use ruff_text_size::Ranged;
 use std::collections::HashMap;
 
 use crate::diagnostic::NPlusOneDiagnostic;
-use crate::ir::binding::{
-    BindingKind, QuerySetContext, QuerySetState, SafeMethod, parse_relation_fields,
-};
+use crate::ir::binding::{BindingKind, QuerySetState};
 use crate::ir::model::{ModelDef, ModelGraph};
+use crate::passes::extract_attribute_chain;
 use crate::passes::{Pass, functions::QueryFunction};
 
 const DIAGNOSTIC_CODE: &str = "N+1";
@@ -21,7 +20,7 @@ const DIAGNOSTIC_CODE: &str = "N+1";
 #[derive(Debug, Clone)]
 struct LoopContext {
     loop_var: String,
-    queryset_context: QuerySetContext,
+    queryset_state: QuerySetState,
 }
 
 #[derive(Debug)]
@@ -37,6 +36,156 @@ impl ScopeState {
     }
 }
 
+pub struct QuerySetClassifier;
+
+impl QuerySetClassifier {
+    fn classify_expr(
+        &self,
+        expr: &Expr,
+        model_graph: &ModelGraph,
+        scopes: &[ScopeState],
+    ) -> BindingKind {
+        let mut curr_expr = expr;
+        let mut model = None;
+
+        if let Expr::Call(call) = expr
+            && let Expr::Name(func_name) = call.func.as_ref()
+            && func_name.id.ends_with("get_object_or_404") // matches the async version too
+             // First arg is the model class
+            && let Some(Expr::Name(model_name)) = call.arguments.args.first()
+        {
+            return BindingKind::ModelInstance(model_name.id.to_string());
+        }
+
+        let mut calls = Vec::new();
+
+        loop {
+            match curr_expr {
+                Expr::Call(call) => {
+                    calls.push(call);
+
+                    if let Some(name) = call.func.as_name_expr()
+                        && name.id == "list"
+                    {
+                        // Capture when the queryset is wrapped in a list,
+                        // like list(User.objects.all())
+                        curr_expr = call.arguments.args.first().unwrap_or(&call.func);
+                        continue;
+                    }
+
+                    curr_expr = &call.func;
+                }
+                Expr::Attribute(attr) => {
+                    curr_expr = &attr.value;
+                    if model.is_some() {
+                        continue; // Already captured
+                    }
+                    let (base, chain) = extract_attribute_chain(attr);
+                    model = model_graph.get(base);
+
+                    if model.is_some() {
+                        // Check for chained access if a model name
+                        // was detected
+                        for expr in chain.iter() {
+                            if model_graph.is_relation(base, expr) {
+                                model = model_graph
+                                    .get_relation(base, expr)
+                                    .and_then(|m| model_graph.get(m));
+                                break;
+                            }
+                        }
+                    }
+
+                    if model.is_none()
+                        && let Some(captured) = lookup(base, scopes)
+                    {
+                        match captured {
+                            BindingKind::QuerySet(state) => {
+                                let mut state = state.clone();
+                                calls.iter().for_each(|c| state.apply_call(c));
+
+                                if let Some(related_model) =
+                                    model_graph.get(state.model_name.as_str())
+                                {
+                                    model = self.try_get_related_model(
+                                        &chain,
+                                        &related_model.name,
+                                        model_graph,
+                                    );
+
+                                    // Skip if the model has been found in the last step
+                                    if model.is_some() {
+                                        continue;
+                                    }
+
+                                    return captured.clone();
+                                }
+                            }
+                            BindingKind::ModelInstance(instance) => {
+                                model = self.try_get_related_model(&chain, instance, model_graph);
+
+                                // Skip if the model was found in the last step
+                                if model.is_some() {
+                                    continue;
+                                }
+
+                                model = model_graph
+                                    .get_relation(base, attr.attr.id.as_str())
+                                    .and_then(|m| model_graph.get(m));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Expr::Name(name) => {
+                    if model.is_none()
+                        && let Some(kind) = lookup(name.id.as_str(), scopes)
+                        && let BindingKind::QuerySet(state) = kind
+                    {
+                        let mut state = state.clone();
+                        calls.iter().for_each(|c| state.apply_call(c));
+                        return BindingKind::QuerySet(state);
+                    };
+
+                    break;
+                }
+                _ => return BindingKind::Unknown,
+            }
+        }
+
+        let Some(model) = model else {
+            return BindingKind::Unknown;
+        };
+
+        let mut state = QuerySetState::new(model.name.clone());
+
+        calls.iter().for_each(|c| state.apply_call(c));
+
+        BindingKind::QuerySet(state)
+    }
+
+    fn try_get_related_model<'a>(
+        &self,
+        chain: &[&str],
+        model_name: &str,
+        model_graph: &'a ModelGraph,
+    ) -> Option<&'a ModelDef> {
+        let mut model = None;
+        // Check for chained access if a model variable
+        // was detected
+        for expr in chain.iter() {
+            if model_graph.is_relation(model_name, expr) {
+                model = model_graph
+                    .get_relation(model_name, expr)
+                    .and_then(|m| model_graph.get(m));
+                break;
+            }
+        }
+
+        model
+    }
+}
+
 pub struct NPlusOnePass<'a> {
     filename: &'a str,
     source: &'a str,
@@ -45,6 +194,7 @@ pub struct NPlusOnePass<'a> {
     active_loops: Vec<LoopContext>,
     functions: &'a [QueryFunction],
     diagnostics: Vec<NPlusOneDiagnostic>,
+    classifier: QuerySetClassifier,
 }
 
 impl<'a> NPlusOnePass<'a> {
@@ -62,6 +212,7 @@ impl<'a> NPlusOnePass<'a> {
             active_loops: Vec::new(),
             diagnostics: Vec::new(),
             functions,
+            classifier: QuerySetClassifier,
         }
     }
 
@@ -81,204 +232,15 @@ impl<'a> NPlusOnePass<'a> {
         }
     }
 
-    fn lookup(&self, name: &str) -> Option<&BindingKind> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(kind) = scope.symbols.get(name) {
-                return Some(kind);
-            }
-        }
-        None
-    }
-
     fn record_assignment(&mut self, target: &'a Expr, value: &'a Expr) {
-        let kind = self.classify_expr(value);
+        let kind = self
+            .classifier
+            .classify_expr(value, self.model_graph, &self.scopes);
         if let Expr::Name(name) = target {
             self.current_scope_mut()
                 .symbols
                 .insert(name.id.to_string(), kind);
         }
-    }
-
-    fn classify_expr(&self, expr: &'a Expr) -> BindingKind {
-        let mut safe_methods = Vec::new();
-        let mut curr_expr = expr;
-        let mut model = None;
-
-        if let Expr::Call(call) = expr
-            && let Expr::Name(func_name) = call.func.as_ref()
-            && func_name.id.ends_with("get_object_or_404") // matches the async version too
-             // First arg is the model class
-            && let Some(Expr::Name(model_name)) = call.arguments.args.first()
-        {
-            return BindingKind::ModelInstance(model_name.id.to_string());
-        }
-
-        loop {
-            match curr_expr {
-                Expr::Call(call) => {
-                    // Collect safe methods
-                    if let Some(safe_method) = self.get_safe_method(call) {
-                        safe_methods.push(safe_method);
-                    }
-
-                    if let Some(name) = call.func.as_name_expr()
-                        && name.id == "list"
-                    {
-                        // Capture when the queryset is wrapped in a list,
-                        // like list(User.objects.all())
-                        curr_expr = call.arguments.args.first().unwrap_or(&call.func);
-                        continue;
-                    }
-
-                    curr_expr = &call.func;
-                }
-                Expr::Attribute(attr) => {
-                    curr_expr = &attr.value;
-                    if model.is_some() {
-                        continue; // Already captured
-                    }
-                    let (base, chain) = self.extract_attribute_chain(attr);
-                    model = self.model_graph.get(base);
-
-                    if model.is_some() {
-                        // Check for chained access if a model name
-                        // was detected
-                        for expr in chain.iter() {
-                            if self.model_graph.is_relation(base, expr) {
-                                model = self
-                                    .model_graph
-                                    .get_relation(base, expr)
-                                    .and_then(|m| self.model_graph.get(m));
-                                break;
-                            }
-                        }
-                    }
-
-                    if model.is_none()
-                        && let Some(captured) = self.lookup(base)
-                    {
-                        match captured {
-                            BindingKind::QuerySet(ctx) => {
-                                if let Some(related_model) = ctx
-                                    .model
-                                    .as_ref()
-                                    .and_then(|m| self.model_graph.get(m.as_str()))
-                                {
-                                    model = self.try_get_related_model(&chain, &related_model.name);
-
-                                    // Skip if the model has been found in the last step
-                                    if model.is_some() {
-                                        continue;
-                                    }
-
-                                    return captured.clone();
-                                }
-                            }
-                            BindingKind::ModelInstance(instance) => {
-                                model = self.try_get_related_model(&chain, instance);
-
-                                // Skip if the model was found in the last step
-                                if model.is_some() {
-                                    continue;
-                                }
-
-                                model = self
-                                    .model_graph
-                                    .get_relation(base, attr.attr.id.as_str())
-                                    .and_then(|m| self.model_graph.get(m));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Expr::Name(name) => {
-                    if model.is_none()
-                        && let Some(kind) = self.lookup(name.id.as_str())
-                        && let BindingKind::QuerySet(ctx) = kind
-                    {
-                        let state = match ctx.state {
-                            QuerySetState::Safe(_) => {
-                                return BindingKind::QuerySet(QuerySetContext {
-                                    state: QuerySetState::Safe(safe_methods),
-                                    model: ctx.model.clone(),
-                                });
-                            }
-                            QuerySetState::Unsafe => QuerySetState::Unsafe,
-                        };
-                        return BindingKind::QuerySet(QuerySetContext {
-                            state,
-                            model: model.map(|m| m.name.clone()),
-                        });
-                    };
-                    break;
-                }
-                _ => break,
-            }
-        }
-
-        let Some(model_instance) = model else {
-            return BindingKind::Unknown;
-        };
-
-        let state = if safe_methods.is_empty() {
-            QuerySetState::Unsafe
-        } else {
-            QuerySetState::Safe(safe_methods)
-        };
-
-        BindingKind::QuerySet(QuerySetContext {
-            state,
-            model: Some(model_instance.name.clone()),
-        })
-    }
-
-    fn try_get_related_model(&self, chain: &[&'a str], model_name: &str) -> Option<&ModelDef> {
-        let mut model = None;
-        // Check for chained access if a model variable
-        // was detected
-        for expr in chain.iter() {
-            if self.model_graph.is_relation(model_name, expr) {
-                model = self
-                    .model_graph
-                    .get_relation(model_name, expr)
-                    .and_then(|m| self.model_graph.get(m));
-                break;
-            }
-        }
-
-        model
-    }
-
-    fn get_safe_method(&self, call: &ruff_python_ast::ExprCall) -> Option<SafeMethod> {
-        const SAFE_QS_METHODS: [&str; 2] = ["select_related", "prefetch_related"];
-        const SAFE_NO_QS_METHODS: [&str; 2] = ["values", "values_list"];
-
-        let mut safe_method = None;
-
-        let attr = call.func.as_attribute_expr()?;
-        let name = attr.attr.id.as_str();
-
-        if SAFE_NO_QS_METHODS.contains(&name) {
-            return Some(SafeMethod {
-                prefetched_relations: Vec::new(),
-            });
-        }
-
-        if SAFE_QS_METHODS.contains(&name) {
-            let fields: Vec<String> = call
-                .arguments
-                .args
-                .iter()
-                .filter_map(|a| a.as_string_literal_expr())
-                .map(|s| s.value.to_string())
-                .collect();
-
-            safe_method = Some(SafeMethod {
-                prefetched_relations: parse_relation_fields(&fields),
-            });
-        }
-
-        safe_method
     }
 
     fn make_diagnostic(&self, expr: &Expr, loop_var: &str, attr_name: &str) -> NPlusOneDiagnostic {
@@ -301,31 +263,26 @@ impl<'a> NPlusOnePass<'a> {
         )
     }
 
-    fn check_relation_chain(&self, ctx: &QuerySetContext, chain: &[&'a str]) -> bool {
-        let Some(ref model_name) = ctx.model else {
+    fn check_relation_chain(&self, state: &QuerySetState, chain: &[&'a str]) -> bool {
+        let Some(model_name) = self.model_graph.get(&state.model_name) else {
             return false;
         };
 
-        let mut current_model = model_name.as_str();
+        let mut current_model = model_name;
 
         for attr in chain.iter() {
-            let is_relation = self.model_graph.is_relation(current_model, attr);
+            let is_relation = self.model_graph.is_relation(&current_model.name, attr);
 
-            let should_warn = match &ctx.state {
-                QuerySetState::Unsafe => is_relation,
-                QuerySetState::Safe(methods) => {
-                    is_relation
-                        && !methods
-                            .iter()
-                            .any(|p| p.prefetched_relations.iter().any(|a| a == attr))
-                }
-            };
-
+            let should_warn = is_relation && !state.is_access_safe(attr);
             if should_warn {
                 return true;
             }
 
-            let Some(new_current_model) = self.model_graph.get_relation(current_model, attr) else {
+            let Some(new_current_model) = self
+                .model_graph
+                .get_relation(&current_model.name, attr)
+                .and_then(|m| self.model_graph.get(m))
+            else {
                 return false;
             };
 
@@ -374,26 +331,21 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         Expr::Name(iter_name) => {
                             if let Expr::Name(target) = for_stmt.target.as_ref() {
                                 if curr_qs.is_none() {
-                                    curr_qs = self.lookup(iter_name.id.as_str()).cloned();
+                                    curr_qs = lookup(iter_name.id.as_str(), &self.scopes).cloned();
                                 }
 
                                 match &curr_qs {
                                     Some(BindingKind::QuerySet(context)) => {
                                         self.active_loops.push(LoopContext {
                                             loop_var: target.id.to_string(),
-                                            queryset_context: context.clone(),
+                                            queryset_state: context.clone(),
                                         });
                                         pushed_loop = true;
                                     }
                                     Some(BindingKind::ModelInstance(instance)) => {
-                                        let context = QuerySetContext {
-                                            model: Some(instance.clone()),
-                                            state: QuerySetState::Unsafe,
-                                        };
-
                                         self.active_loops.push(LoopContext {
                                             loop_var: target.id.to_string(),
-                                            queryset_context: context.clone(),
+                                            queryset_state: QuerySetState::new(instance.clone()),
                                         });
                                         pushed_loop = true;
                                     }
@@ -408,7 +360,11 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         Expr::Call(call) => {
                             // Ensure the data is stored in cases when for is in the form
                             // `for order in user.orders.all(): ... where user is an instance of User
-                            curr_qs = Some(self.classify_expr(expr));
+                            curr_qs = Some(self.classifier.classify_expr(
+                                expr,
+                                self.model_graph,
+                                &self.scopes,
+                            ));
                             expr = &call.func;
                             is_call = true;
                         }
@@ -417,7 +373,11 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             // `for order in user.orders: ... where user is an instance of User
                             // if expr is a Call, that can be in the form user.orders.filter(..)
                             if !is_call {
-                                curr_qs = Some(self.classify_expr(expr));
+                                curr_qs = Some(self.classifier.classify_expr(
+                                    expr,
+                                    self.model_graph,
+                                    &self.scopes,
+                                ));
                             }
 
                             expr = &attr.value
@@ -444,15 +404,14 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         match expr {
             Expr::Attribute(attr) => {
-                let (base_name, attr_chain) = self.extract_attribute_chain(attr);
+                let (base_name, attr_chain) = extract_attribute_chain(attr);
 
                 for ctx in &self.active_loops {
                     if base_name != ctx.loop_var {
                         continue;
                     }
 
-                    let is_n_plus_one =
-                        self.check_relation_chain(&ctx.queryset_context, &attr_chain);
+                    let is_n_plus_one = self.check_relation_chain(&ctx.queryset_state, &attr_chain);
 
                     if is_n_plus_one {
                         self.diagnostics.push(self.make_diagnostic(
@@ -471,7 +430,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 // expects a queryset in that parameter
                 for arg in call.arguments.args.iter() {
                     if let Expr::Name(name) = arg
-                        && let Some(bind) = self.lookup(&name.id)
+                        && let Some(bind) = lookup(&name.id, &self.scopes)
                         && let Some(f) = self.functions.iter().find(|f| {
                             call.func
                                 .as_name_expr()
@@ -483,42 +442,17 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             .iter()
                             .enumerate()
                             .find(|(_, a)| a.as_name_expr().is_some_and(|n| n.id == name.id))
-                        && let BindingKind::QuerySet(queryset_context) = bind
+                        && let BindingKind::QuerySet(state) = bind
                     {
-                        match &queryset_context.state {
-                            // If it is safe, look for a no prefetched relation
-                            QuerySetState::Safe(safe_methods) => {
-                                for a in f.args.iter() {
-                                    if a.idx == arg_idx
-                                        && a.attr_accesses.iter().any(|aa| {
-                                            self.model_graph.is_relation(&a.model_name, aa)
-                                                && !safe_methods.iter().any(|sm| {
-                                                    sm.prefetched_relations.iter().any(|r| r == aa)
-                                                })
-                                        })
-                                    {
-                                        diagnostics.push(self.make_diagnostic(
-                                            expr,
-                                            &name.id,
-                                            &a.var_name,
-                                        ));
-                                    }
-                                }
-                            }
-                            // If it is unsafe, check for anu relation accesed inside the function
-                            QuerySetState::Unsafe => {
-                                for a in f.args.iter() {
-                                    if a.attr_accesses
-                                        .iter()
-                                        .any(|aa| self.model_graph.is_relation(&a.model_name, aa))
-                                    {
-                                        diagnostics.push(self.make_diagnostic(
-                                            expr,
-                                            &name.id,
-                                            &a.var_name,
-                                        ));
-                                    }
-                                }
+                        // If it is safe, look for a no prefetched relation
+                        for a in f.args.iter() {
+                            if a.idx == arg_idx
+                                && a.attr_accesses.iter().any(|aa| {
+                                    self.model_graph.is_relation(&a.model_name, aa)
+                                        && !state.is_access_safe(aa)
+                                })
+                            {
+                                diagnostics.push(self.make_diagnostic(expr, &name.id, &a.var_name));
                             }
                         }
                     }
@@ -532,6 +466,15 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
         }
         ruff_python_ast::visitor::walk_expr(self, expr);
     }
+}
+
+fn lookup<'a>(name: &str, scopes: &'a [ScopeState]) -> Option<&'a BindingKind> {
+    for scope in scopes.iter().rev() {
+        if let Some(kind) = scope.symbols.get(name) {
+            return Some(kind);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
