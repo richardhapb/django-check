@@ -343,6 +343,73 @@ impl<'a> NPlusOnePass<'a> {
 
         false
     }
+
+    fn analyze_for_stmt(&mut self, iter: &Expr, target: &Expr) -> bool {
+        let mut pushed_loop = false;
+        let mut expr = iter;
+        let mut curr_sym_id = None;
+        let mut is_call = false;
+
+        loop {
+            match expr {
+                Expr::Name(iter_name) => {
+                    if let Expr::Name(target) = target {
+                        if curr_sym_id.is_none() {
+                            curr_sym_id = self
+                                .scope_manager
+                                .lookup(iter_name.id.as_str())
+                                .map(|s| *s.id());
+                        }
+
+                        match curr_sym_id
+                            .and_then(|id| self.scope_manager.django_symbol(&id).map(|ds| ds.kind))
+                        {
+                            Some(DjangoSymbolKind::QuerySet(context)) => {
+                                self.active_loops.push(LoopContext {
+                                    loop_var: target.id.to_string(),
+                                    queryset_state: context.clone(),
+                                });
+                                pushed_loop = true;
+                            }
+                            Some(DjangoSymbolKind::ModelInstance(instance)) => {
+                                self.active_loops.push(LoopContext {
+                                    loop_var: target.id.to_string(),
+                                    queryset_state: QuerySetState::new(instance.clone()),
+                                });
+                                pushed_loop = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    break;
+                }
+                // In both cases are not necessary to record the classification because
+                // are temporary values in the `for` and we call walk_stmt here, then
+                // drop the classification is ok
+                Expr::Call(call) => {
+                    let classifier = QuerySetClassifier::new(&self.scope_manager);
+                    // Ensure the data is stored in cases when for is in the form
+                    // `for order in user.orders.all(): ... where user is an instance of User
+                    curr_sym_id = Some(classifier.classify_expr(expr, self.model_graph));
+                    expr = &call.func;
+                    is_call = true;
+                }
+                Expr::Attribute(attr) => {
+                    let classifier = QuerySetClassifier::new(&self.scope_manager);
+                    // Ensure the data is stored in cases when for is in the form
+                    // `for order in user.orders: ... where user is an instance of User
+                    // if expr is a Call, that can be in the form user.orders.filter(..)
+                    if !is_call {
+                        curr_sym_id = Some(classifier.classify_expr(expr, self.model_graph));
+                    }
+
+                    expr = &attr.value
+                }
+                _ => break,
+            }
+        }
+        pushed_loop
+    }
 }
 
 impl<'a> Pass<'a> for NPlusOnePass<'a> {
@@ -372,72 +439,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
             }
             Stmt::For(for_stmt) => {
-                let mut pushed_loop = false;
-
-                let mut expr = for_stmt.iter.as_ref();
-                let mut curr_sym_id = None;
-                let mut is_call = false;
-
-                loop {
-                    match expr {
-                        Expr::Name(iter_name) => {
-                            if let Expr::Name(target) = for_stmt.target.as_ref() {
-                                if curr_sym_id.is_none() {
-                                    curr_sym_id = self
-                                        .scope_manager
-                                        .lookup(iter_name.id.as_str())
-                                        .map(|s| *s.id());
-                                }
-
-                                match curr_sym_id.and_then(|id| {
-                                    self.scope_manager.django_symbol(&id).map(|ds| ds.kind)
-                                }) {
-                                    Some(DjangoSymbolKind::QuerySet(context)) => {
-                                        self.active_loops.push(LoopContext {
-                                            loop_var: target.id.to_string(),
-                                            queryset_state: context.clone(),
-                                        });
-                                        pushed_loop = true;
-                                    }
-                                    Some(DjangoSymbolKind::ModelInstance(instance)) => {
-                                        self.active_loops.push(LoopContext {
-                                            loop_var: target.id.to_string(),
-                                            queryset_state: QuerySetState::new(instance.clone()),
-                                        });
-                                        pushed_loop = true;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            break;
-                        }
-                        // In both cases are not necessary to record the classification because
-                        // are temporary values in the `for` and we call walk_stmt here, then
-                        // drop the classification is ok
-                        Expr::Call(call) => {
-                            let classifier = QuerySetClassifier::new(&self.scope_manager);
-                            // Ensure the data is stored in cases when for is in the form
-                            // `for order in user.orders.all(): ... where user is an instance of User
-                            curr_sym_id = Some(classifier.classify_expr(expr, self.model_graph));
-                            expr = &call.func;
-                            is_call = true;
-                        }
-                        Expr::Attribute(attr) => {
-                            let classifier = QuerySetClassifier::new(&self.scope_manager);
-                            // Ensure the data is stored in cases when for is in the form
-                            // `for order in user.orders: ... where user is an instance of User
-                            // if expr is a Call, that can be in the form user.orders.filter(..)
-                            if !is_call {
-                                curr_sym_id =
-                                    Some(classifier.classify_expr(expr, self.model_graph));
-                            }
-
-                            expr = &attr.value
-                        }
-                        _ => break,
-                    }
-                }
-
+                let pushed_loop = self.analyze_for_stmt(&for_stmt.iter, &for_stmt.target);
                 ruff_python_ast::visitor::walk_stmt(self, stmt);
 
                 if pushed_loop {
@@ -474,6 +476,11 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                     }
                 }
                 return;
+            }
+            Expr::ListComp(list_comp) => {
+                for generator in list_comp.generators.iter() {
+                    let _ = self.analyze_for_stmt(&generator.iter, &generator.target);
+                }
             }
             Expr::Call(call) => {
                 let mut diagnostics = Vec::new();
@@ -791,26 +798,26 @@ foo(tier1)
         assert!(diags.is_empty());
     }
 
-    //     #[test]
-    //     fn detect_traceback_using_iterable() {
-    //         let source = r#"
-    // class TheoAnalysis(models.Model):
-    //     tier = models.CharField(max_length=11, choices=Tiers.choices)
-    //
-    // class Tier1(models.Model):
-    //     analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
-    //
-    // def foo(t1: Iterable[Tier1]):
-    //     for t in t1:
-    //         print(t.analysis)
-    //
-    // tier1 = Tier1.objects.all()
-    // foo(tier1)
-    //     "#;
-    //         let diags = run_pass(source);
-    //         assert_eq!(diags.len(), 1);
-    //     }
-    //
+    #[test]
+    fn detect_traceback_using_iterable() {
+        let source = r#"
+class TheoAnalysis(models.Model):
+    tier = models.CharField(max_length=11, choices=Tiers.choices)
+
+class Tier1(models.Model):
+    analysis = models.ForeignKey("theo.TheoAnalysis", on_delete=models.CASCADE, related_name="tier1s", null=True)
+
+def foo(t1: Iterable[Tier1]):
+    for t in t1:
+        print(t.analysis)
+
+tier1 = Tier1.objects.all()
+foo(tier1)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
     #[test]
     fn detect_n1_after_get_object_or_404() {
         let source = r#"
@@ -849,30 +856,30 @@ for order in user.orders.all():
         assert_eq!(diags.len(), 1);
     }
 
-    //     #[test]
-    //     fn detect_n1_nested_relation_access_in_for() {
-    //         let source = r#"
-    // class User(Model):
-    //     pass
-    //
-    // class Method(Model):
-    //     pass
-    //
-    // class Payment(Model):
-    //     user = models.ForeignKey(User, related_name="payments")
-    //     method = models.ForeignKey(Method, related_name="payments")
-    //
-    // class Order(Model):
-    //     users = models.ManyToManyField(User, related_name="orders")
-    //
-    // orders = Order.objects.all()
-    // for user in orders.users:
-    //     for payment in user.payments:
-    //         print(payment.method)
-    //     "#;
-    //         let diags = run_pass(source);
-    //         assert_eq!(diags.len(), 1);
-    //     }
+    #[test]
+    fn detect_n1_nested_relation_access_in_for() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Method(Model):
+    pass
+
+class Payment(Model):
+    user = models.ForeignKey(User, related_name="payments")
+    method = models.ForeignKey(Method, related_name="payments")
+
+class Order(Model):
+    users = models.ManyToManyField(User, related_name="orders")
+
+orders = Order.objects.all()
+for user in orders.users:
+    for payment in user.payments:
+        print(payment.method)
+    "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
 
     #[test]
     fn detect_n1_in_list() {
@@ -961,19 +968,19 @@ for order in orders.iterator():
         assert!(diags.is_empty());
     }
 
-    //     #[test]
-    //     fn detect_n1_using_comprehension() {
-    //         let source = r#"
-    // class User(Model):
-    //     pass
-    //
-    // class Order(Model):
-    //     user = models.ForeignKey(User, related_name="orders")
-    //
-    // orders = Order.objects.all()
-    // print([order.user for order in orders])
-    //     "#;
-    //         let diags = run_pass(source);
-    //         assert_eq!(diags.len(), 1);
-    //     }
+    #[test]
+    fn detect_n1_using_comprehension() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+orders = Order.objects.all()
+print([order.user for order in orders])
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
 }
