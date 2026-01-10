@@ -6,8 +6,7 @@ Static N+1 query detection for Django (LSP-based)
 
 <img width="1049" height="287" alt="image" src="https://github.com/user-attachments/assets/34103185-f6a1-4bc5-950a-ebf2b46b7d9f" />
 
-
-The goal is not to replace runtime profilers, but to shift performance feedback left, into the editor.
+It works inside the editor or directly from CLI.
 
 > [!WARNING]
 > This project is in active development and **not yet production-ready**.
@@ -24,11 +23,11 @@ Django’s ORM makes it easy to accidentally introduce N+1 queries that:
 * look correct in code review,
 * only show up under load.
 
-Runtime tools (django-silk, nplusone) are reactive. `django-check` is proactive.
+Runtime tools (django-silk, nplusone) are focuesd in runtime optimiezation. `django-check` make static analysis before the runtime.
 
 ## Key properties
 
-* Static analysis only (no runtime hooks)
+* Compute the graph of the `Model`s in the app
 * Zero runtime overhead
 * LSP-based diagnostics at edit time
 * No code instrumentation required
@@ -42,37 +41,46 @@ Runtime tools (django-silk, nplusone) are reactive. `django-check` is proactive.
   * ForeignKey
   * OneToOne
   * ManyToMany
-  * reverse relations (basic cases)
-
-Example pattern:
-
-```python
-users = User.objects.all()
-for user in users:
-    user.profile.bio
-```
-
-## What it does NOT do (yet)
-
-* Does not execute Django code
-* Does not observe real queries
-* Does not infer dynamic queryset construction
-* Limited support for custom queryset methods
-* No deep analysis of properties that hide ORM access
-
-## Demo
-
-_WORK IN PROGRESS_
+  * Inheritance
+  * Reverse relations (with `related_name` explicit or not)
 
 ## Installation
 
-### Binary
+Not available yet, should be compiled from source.
 
-_WORK IN PROGRESS_
 
-This installs the `django-check` binary, which also acts as an LSP server.
+## CLI
 
-## Editor integration
+```
+Usage: djch <COMMAND>
+
+Commands:
+  server  Start as a Language Server (normally handled by the IDE)
+  check   Analyze the current directory tree for N+1 queries
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help (see more with '--help')
+  -V, --version  Print version
+```
+
+**Check from CLI using `djch check`. You will get an output like this:**
+
+```
+app/foo/bar/views/tier1.py:210:22: [N+1] rp.ticker_benchmark
+Potential N+1 query: accessing `rp.ticker_benchmark` inside loop
+
+app/apps/crawler/tasks.py:48:17: [N+1] ticker.industry
+Potential N+1 query: accessing `ticker.industry` inside loop
+
+app/apps/crawler/views.py:62:20: [N+1] stream.streamer
+Potential N+1 query: accessing `stream.streamer` inside loop
+
+app/apps/foo/selectors/anointed.py:43:19: [N+1] anointed.pattern
+Potential N+1 query: accessing `anointed.pattern` inside loop
+```
+
+## Editor integration (LSP)
 
 ### Neovim 0.11+ (native LSP)
 
@@ -105,15 +113,36 @@ _WORK IN PROGRESS_
 <!-- code --install-extension django-check -->
 <!-- ``` -->
 
-## Example
+## Examples
 
 ### Problematic code
 
 ```python
 # N+1 query detected
 users = User.objects.all()
+profiles = [user.profile in user for users]  # N+1
+```
+
+Explanation:
+
+* `users` is evaluated once
+* `user.profile` triggers one query per iteration
+
+### Corrected code
+
+```python
+users = User.objects.select_related("profile").all()
+profiles = [user.profile in user for users]
+```
+
+---
+
+### Problematic code
+
+```python
+users = User.objects.all()
 for user in users:
-    print(user.profile.bio)
+    user.profile.bio # N+1
 ```
 
 Explanation:
@@ -126,7 +155,7 @@ Explanation:
 ```python
 users = User.objects.select_related("profile").all()
 for user in users:
-    print(user.profile.bio)
+    user.profile.bio
 ```
 
 `django-check` will clear the diagnostic once the relation is prefetched.
@@ -140,30 +169,28 @@ for user in users:
 5. Detect attribute access that implies ORM resolution
 6. Verify whether the required relation is prefetched
 
-This is a static over-approximation. False negatives are preferred over false positives.
-
 ## Design philosophy
 
-* Conservative diagnostics
-* No guessing about runtime state
-* Prefer “I don’t know” over incorrect warnings
+* Zero config
+* Just works out of the box
 * Editor feedback must be actionable, not noisy
 
 ## Limitations (work in progress)
 
-* Django 3.2+ only
 * Interprocedural analysis requires type hints on QuerySet parameters
 * Limited understanding of:
   * `Prefetch` objects
   * `annotate`, `aggregate`
   * complex custom managers
-* No SQL-level cost estimation
+* No complete capture of implicit prefetchs in django chains when has many. e.g.
+  `prefetch_releated(chat.users__profile)`, then iterate over `chat.users` and
+  access to `profile`. This will raise a warning.
 
 ## Roadmap
 
 * Prefetch object support
+* Capture of implicits prefetchs in a root instance
 * Custom queryset method summaries
-* Better integration with `django-stubs`
 * Templates integration
 
 ## Contributing
@@ -174,7 +201,7 @@ This project lives at the intersection of:
 * Django ORM semantics
 * LSP protocol design
 
-If you are interested in any of those, contributions are welcome. Start by reading the analyzer passes; they are intentionally kept small and explicit.
+If you are interested in any of those, contributions are welcome.
 
 Documentation contributions are welcome, the goal is make this tool easy to use.
 
