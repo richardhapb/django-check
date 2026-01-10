@@ -7,7 +7,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace};
 
 #[derive(Debug, Clone)]
 struct Backend {
@@ -21,7 +21,6 @@ struct Backend {
 }
 
 impl Backend {
-    #[allow(dead_code)]
     fn reanalyze_graph(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         *self.model_graph.lock().unwrap() = self.parser.extract_model_graph(&self.cwd)?;
         Ok(())
@@ -73,7 +72,13 @@ impl LanguageServer for Backend {
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
         debug!("method: textDocument/didChange");
         if let Some(cch) = params.content_changes.first() {
-            *self.current_source.lock().unwrap() = cch.text.clone()
+            *self.current_source.lock().unwrap() = cch.text.clone();
+            if check_if_contains_models(&cch.text) {
+                debug!("re-analyzing graph");
+                self.reanalyze_graph().unwrap_or_else(|e| {
+                    error!(?e, "updating graph");
+                });
+            }
         }
     }
 
@@ -128,6 +133,11 @@ fn build_server_info() -> ServerInfo {
         name: "django-check".into(),
         version: Some("0.0.1".into()),
     }
+}
+
+/// Basic check if the document is a model document
+fn check_if_contains_models(source: &str) -> bool {
+    source.contains("(models.Model)") || source.contains("(Model)")
 }
 
 pub async fn serve(cwd: &Path, model_graph: ModelGraph, functions: Vec<QueryFunction>) {

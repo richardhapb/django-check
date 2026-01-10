@@ -1,5 +1,6 @@
 #![feature(if_let_guard)]
 #![feature(slice_pattern)]
+#![allow(dead_code)] // Under development
 mod diagnostic;
 mod error;
 mod ir;

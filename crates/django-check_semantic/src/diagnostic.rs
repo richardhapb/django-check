@@ -2,7 +2,7 @@ use lsp_types::{
     CodeDescription, Diagnostic, DiagnosticSeverity, NumberOrString, Position, Range, Url,
 };
 
-#[derive(Debug)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 pub struct NPlusOneDiagnostic {
     pub filename: String,
     pub line: usize,

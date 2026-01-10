@@ -265,7 +265,7 @@ pub struct NPlusOnePass<'a> {
     model_graph: &'a ModelGraph,
     active_loops: Vec<LoopContext>,
     functions: &'a [QueryFunction],
-    diagnostics: Vec<NPlusOneDiagnostic>,
+    diagnostics: HashSet<NPlusOneDiagnostic>,
 }
 
 impl<'a> NPlusOnePass<'a> {
@@ -281,7 +281,7 @@ impl<'a> NPlusOnePass<'a> {
             model_graph,
             scope_manager: ScopeManager::new(),
             active_loops: Vec::new(),
-            diagnostics: Vec::new(),
+            diagnostics: HashSet::new(),
             functions,
         }
     }
@@ -307,11 +307,8 @@ impl<'a> NPlusOnePass<'a> {
             line,
             col,
             DIAGNOSTIC_CODE,
-            format!("{}.{}", loop_var, attr_name),
-            format!(
-                "Potential N+1 query: accessing `{}.{}` inside loop",
-                loop_var, attr_name
-            ),
+            format!("{loop_var}.{attr_name}"),
+            format!("Potential N+1 query: accessing `{loop_var}.{attr_name}` inside loop",),
         )
     }
 
@@ -419,7 +416,7 @@ impl<'a> Pass<'a> for NPlusOnePass<'a> {
         for stmt in &module.body {
             self.visit_stmt(stmt);
         }
-        std::mem::take(&mut self.diagnostics)
+        self.diagnostics.drain().collect()
     }
 }
 
@@ -468,7 +465,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                     let is_n_plus_one = self.check_relation_chain(&ctx.queryset_state, &attr_chain);
 
                     if is_n_plus_one {
-                        self.diagnostics.push(self.make_diagnostic(
+                        self.diagnostics.insert(self.make_diagnostic(
                             expr,
                             &ctx.loop_var,
                             &attr_chain.join("."),
@@ -483,7 +480,6 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                 }
             }
             Expr::Call(call) => {
-                let mut diagnostics = Vec::new();
                 // Detect if a query set is passed to a function
                 // and the function expect a queryset, also the function
                 // expects a queryset in that parameter
@@ -511,13 +507,14 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                                         && !state.is_access_safe(aa)
                                 })
                             {
-                                diagnostics.push(self.make_diagnostic(expr, &name.id, &a.var_name));
+                                self.diagnostics.insert(self.make_diagnostic(
+                                    expr,
+                                    &name.id,
+                                    &a.var_name,
+                                ));
                             }
                         }
                     }
-                }
-                if !diagnostics.is_empty() {
-                    self.diagnostics.append(&mut diagnostics);
                 }
             }
 
