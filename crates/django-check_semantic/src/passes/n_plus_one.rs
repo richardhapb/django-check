@@ -56,8 +56,6 @@ impl SymbolTable {
     fn lookup(&self, name: &str) -> Option<&DjangoSymbol> {
         for scope in self.scopes.iter().rev() {
             if let Some(id) = scope.get(name) {
-                // IDs are strictly internal indices, so this unwrap is safe
-                // unless the store was corrupted.
                 return self.store.get(id.0 as usize);
             }
         }
@@ -360,16 +358,14 @@ impl<'a> NPlusOnePass<'a> {
 
     /// Extract model name from a type annotation like `QuerySet[Model]` or `Iterable[Model]`
     fn extract_model_from_annotation(&self, annotation: &Expr) -> Option<String> {
-        if let Expr::Subscript(subscript) = annotation {
+        if let Expr::Subscript(subscript) = annotation
             // Check if the base is QuerySet or Iterable
-            if let Expr::Name(name) = &*subscript.value
-                && (name.id == "QuerySet" || name.id == "Iterable" || name.id == "Iterator")
-            {
-                // Extract the model from the slice
-                if let Expr::Name(model_name) = &*subscript.slice {
-                    return Some(model_name.id.to_string());
-                }
-            }
+            && let Expr::Name(name) = &*subscript.value
+            && (name.id == "QuerySet" || name.id == "Iterable" || name.id == "Iterator")
+            // Extract the model from the slice
+            && let Expr::Name(model_name) = &*subscript.slice
+        {
+            return Some(model_name.id.to_string());
         }
         None
     }
@@ -592,11 +588,8 @@ fn build_diagnostic(
         line,
         col,
         DIAGNOSTIC_CODE,
-        format!("{}.{}", loop_var, attr_chain),
-        format!(
-            "Potential N+1 query: accessing `{}.{}` inside loop",
-            loop_var, attr_chain
-        ),
+        format!("{loop_var}.{attr_chain}"),
+        format!("Potential N+1 query: accessing `{loop_var}.{attr_chain}` inside loop",),
     )
 }
 
