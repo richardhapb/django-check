@@ -34,7 +34,7 @@ jobs:
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: nightly
           target: ${{ matrix.target }}
 
       - name: Install cross (Ubuntu only)
@@ -67,7 +67,7 @@ jobs:
           fi
           cp target/${{ matrix.target }}/release/$BIN$EXT dist/
           pushd dist
-          eval $COMPRESS_CMD "${BIN}-${{ matrix.target }}.$ARCHIVE_EXT" "$BIN$EXT"
+          eval $COMPRESS_CMD "django-check-${{ matrix.target }}.$ARCHIVE_EXT" "$BIN$EXT"
           popd
 
       - name: Upload build artifact

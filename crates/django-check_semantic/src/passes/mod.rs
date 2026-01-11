@@ -21,9 +21,7 @@ pub trait Pass<'a> {
 ///
 /// Returns
 ///     tuple with the base element of the sentence and all the posterior expressions
-fn extract_attribute_chain<'a>(
-    attr: &'a ruff_python_ast::ExprAttribute,
-) -> (&'a str, Vec<&'a str>) {
+fn extract_attribute_chain(attr: &ruff_python_ast::ExprAttribute) -> (&str, Vec<&str>) {
     let mut chain = vec![attr.attr.id.as_str()];
     let mut current = attr.value.as_ref();
 
