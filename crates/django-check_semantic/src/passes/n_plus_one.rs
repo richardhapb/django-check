@@ -102,7 +102,9 @@ impl<'a> QuerySetResolver<'a> {
         {
             // First arg is usually the model class
             if let Some(Expr::Name(model_name)) = call.arguments.args.first() {
-                return Some(DjangoSymbol::ModelInstance(model_name.id.to_string()));
+                return Some(DjangoSymbol::ModelInstance(QuerySetState::new(
+                    model_name.id.to_string(),
+                )));
             }
         }
 
@@ -124,7 +126,7 @@ impl<'a> QuerySetResolver<'a> {
             DjangoSymbol::QuerySet(mut state) => {
                 // Check if this method returns a single instance
                 if SINGLE_INSTANCE_METHODS.contains(&method_name.as_str()) {
-                    return Some(DjangoSymbol::ModelInstance(state.model_name));
+                    return Some(DjangoSymbol::ModelInstance(state));
                 }
 
                 // Apply the side effect of the call (e.g. .prefetch_related) to the state
@@ -148,29 +150,24 @@ impl<'a> QuerySetResolver<'a> {
         // Try to resolve the value being accessed
         if let Some(base_sym) = self.resolve(&attr.value) {
             match base_sym {
-                DjangoSymbol::ModelInstance(model_name) => {
+                DjangoSymbol::ModelInstance(state) | DjangoSymbol::QuerySet(state) => {
                     // Accessing `user.orders` -> Returns a QuerySet for the related model
-                    if let Some(related_model) =
-                        self.model_graph.get_relation(&model_name, &attr.attr.id)
-                    {
-                        return Some(DjangoSymbol::QuerySet(QuerySetState::new(
-                            related_model.to_string(),
-                        )));
-                    }
-                    // Could be accessing a regular field, return None
-                    return None;
-                }
-                DjangoSymbol::QuerySet(state) => {
                     // Accessing an attribute on a queryset (e.g., `orders.users`)
                     // If it's a relation on the model, return a QuerySet of the related model
                     if let Some(related_model) = self
                         .model_graph
                         .get_relation(&state.model_name, &attr.attr.id)
                     {
-                        return Some(DjangoSymbol::QuerySet(QuerySetState::new(
-                            related_model.to_string(),
-                        )));
+                        let mut new_state = QuerySetState::new(related_model.to_string());
+                        // FIXME: Currently we use the current relations to be inherited by the related
+                        // model, probably a better idea is to detect dynamically the appropiates
+                        // prefetched relations but for now this is ok.
+                        new_state
+                            .prefetched_relations
+                            .extend(state.prefetched_relations);
+                        return Some(DjangoSymbol::QuerySet(new_state));
                     }
+                    // Could be accessing a regular field, return None
                     return None;
                 }
             }
@@ -445,9 +442,9 @@ impl<'a> NPlusOnePass<'a> {
                         loop_var: target_name.id.to_string(),
                         queryset_state: qs,
                     }),
-                    DjangoSymbol::ModelInstance(model) => Some(LoopContext {
+                    DjangoSymbol::ModelInstance(state) => Some(LoopContext {
                         loop_var: target_name.id.to_string(),
-                        queryset_state: QuerySetState::new(model),
+                        queryset_state: state,
                     }),
                 };
 
@@ -455,7 +452,7 @@ impl<'a> NPlusOnePass<'a> {
                     // Declare the loop variable in the symbol table
                     self.symbols.declare(
                         &ctx.loop_var,
-                        DjangoSymbol::ModelInstance(ctx.queryset_state.model_name.clone()),
+                        DjangoSymbol::ModelInstance(ctx.queryset_state.clone()),
                     );
                     self.active_loops.push(ctx);
                 }
@@ -622,9 +619,9 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             loop_var: target_name.id.to_string(),
                             queryset_state: qs,
                         }),
-                        DjangoSymbol::ModelInstance(model) => Some(LoopContext {
+                        DjangoSymbol::ModelInstance(state) => Some(LoopContext {
                             loop_var: target_name.id.to_string(),
-                            queryset_state: QuerySetState::new(model),
+                            queryset_state: state,
                         }),
                     };
 
@@ -632,7 +629,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                         // Declare the loop variable in the symbol table as a ModelInstance
                         self.symbols.declare(
                             &ctx.loop_var,
-                            DjangoSymbol::ModelInstance(ctx.queryset_state.model_name.clone()),
+                            DjangoSymbol::ModelInstance(ctx.queryset_state.clone()),
                         );
                         self.active_loops.push(ctx);
                         loop_entered = true;

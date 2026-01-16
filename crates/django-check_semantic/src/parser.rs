@@ -89,8 +89,14 @@ impl Parser {
         let mut combined_graph = ModelGraph::new();
 
         for entry in Self::python_files(dir) {
-            let source = fs::read_to_string(entry.path())?;
             let filename = Self::relative_path(dir, entry.path());
+            let source = match fs::read_to_string(entry.path()) {
+                Ok(source) => source,
+                Err(err) => {
+                    warn!(%err, source=%filename, "parsing graph");
+                    continue;
+                }
+            };
             let parsed = match self.parse_module(&source) {
                 Ok(parsed) => parsed,
                 Err(err) => {
@@ -110,7 +116,13 @@ impl Parser {
     pub fn extract_functions(&self, dir: &Path) -> Result<Vec<QueryFunction>, SourceParseError> {
         let mut functions = Vec::new();
         for entry in Self::python_files(dir) {
-            let source = fs::read_to_string(entry.path())?;
+            let source = match fs::read_to_string(entry.path()) {
+                Ok(source) => source,
+                Err(err) => {
+                    warn!(%err, source=?entry.path(), "parsing functions");
+                    continue;
+                }
+            };
             let parsed = match self.parse_module(&source) {
                 Ok(parsed) => parsed,
                 Err(err) => {
@@ -137,7 +149,7 @@ impl Parser {
         let diagnostics = self.analyze_n_plus_one(dir, model_graph, functions)?;
 
         for diag in &diagnostics {
-            println!("{}\n", diag);
+            println!("{diag}\n");
         }
 
         println!("\nTotal N+1 warnings: {}", diagnostics.len());

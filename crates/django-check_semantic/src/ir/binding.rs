@@ -37,7 +37,7 @@ pub enum DjangoSymbol {
     /// A `QuerySet` instance (e.g., `User.objects.all()`)
     QuerySet(QuerySetState),
     /// A Model instance (e.g., `user` inside a loop)
-    ModelInstance(String),
+    ModelInstance(QuerySetState),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
