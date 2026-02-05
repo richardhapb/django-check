@@ -108,10 +108,9 @@ If you are already attaching multiple LSPs to Python buffers (e.g. Pyright), Neo
 
 ### VS Code (Extension)
 
-_WORK IN PROGRESS_
-<!-- ```bash -->
-<!-- code --install-extension django-check -->
-<!-- ``` -->
+You can install the VSCode extension from, or directly in VSCode Extensions Market Place.
+
+[https://marketplace.visualstudio.com/items?itemName=richardhapb.Django-Check](https://marketplace.visualstudio.com/items?itemName=richardhapb.Django-Check)
 
 ## Examples
 
