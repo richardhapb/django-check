@@ -40,7 +40,7 @@ impl LanguageServer for Backend {
                     DiagnosticOptions {
                         identifier: None,
                         inter_file_dependencies: false,
-                        workspace_diagnostics: true,
+                        workspace_diagnostics: false,
                         work_done_progress_options: WorkDoneProgressOptions::default(),
                     },
                 )),
