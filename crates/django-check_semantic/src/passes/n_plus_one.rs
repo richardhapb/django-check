@@ -1,7 +1,7 @@
 //! N+1 query detection pass.
 
-use ruff_python_ast::ModModule;
 use ruff_python_ast::{Expr, Stmt, visitor::Visitor, visitor::walk_expr, visitor::walk_stmt};
+use ruff_python_ast::{ExprCall, ModModule};
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -200,18 +200,40 @@ impl<'a> QuerySetResolver<'a> {
         if SAFE_NO_QS_METHODS.contains(&method_name) {
             state.is_values_query = true;
         } else if SAFE_QS_METHODS.contains(&method_name) {
-            let fields: Vec<String> = call
+            let mut literal_fields =
+                Self::resolve_prefetch_literal_fields(call.arguments.args.as_ref());
+
+            let call_fields: Vec<&ExprCall> = call
                 .arguments
                 .args
                 .iter()
-                .filter_map(|a| a.as_string_literal_expr())
-                .map(|s| s.value.to_string())
+                .filter_map(|a| a.as_call_expr())
                 .collect();
 
+            // Parse all the fields inside the `Prefetch` object if it is present
+            for call_field in call_fields {
+                if call_field
+                    .func
+                    .as_name_expr()
+                    .is_some_and(|n| n.id == "Prefetch")
+                {
+                    literal_fields.extend(Self::resolve_prefetch_literal_fields(
+                        call_field.arguments.args.as_ref(),
+                    ));
+                }
+            }
+
             // Helper from binding.rs
-            let relations = crate::ir::binding::parse_relation_fields(&fields);
+            let relations = crate::ir::binding::parse_relation_fields(&literal_fields);
             state.prefetched_relations.extend(relations);
         }
+    }
+
+    fn resolve_prefetch_literal_fields(args: &[Expr]) -> Vec<String> {
+        args.iter()
+            .filter_map(|a| a.as_string_literal_expr())
+            .map(|s| s.value.to_string())
+            .collect()
     }
 }
 
@@ -1216,5 +1238,22 @@ print([order.user for order in orders])
         "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_prefetch_object_basic() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+
+users = User.objects.all().prefetch_related(Prefetch("orders"))
+print([user.orders for user in users])
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
     }
 }
