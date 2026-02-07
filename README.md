@@ -43,6 +43,8 @@ Runtime tools (django-silk, nplusone) are focuesd in runtime optimiezation. `dja
   * ManyToMany
   * Inheritance
   * Reverse relations (with `related_name` explicit or not)
+  * Complex chained relations like `model__relation__child_relation__depth`
+  * Prefetch usage: `Prefetch("relation", queryset=Relation.objects.select_related("child")`
 
 ## Installation
 
@@ -178,13 +180,11 @@ for user in users:
 
 * Interprocedural analysis requires type hints on QuerySet parameters
 * Limited understanding of:
-  * `Prefetch` objects with basic access support (e.g. `Prefetch("related_model")`)
   * `annotate`, `aggregate`
   * complex custom managers
 
 ## Roadmap
 
-* Complete Prefetch object support
 * Custom queryset method summaries
 * Templates integration
 

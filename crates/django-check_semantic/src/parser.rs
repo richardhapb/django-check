@@ -113,7 +113,7 @@ impl Parser {
             .parse_module(source)
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "parsing module"))?;
 
-        let mut pass = ModelGraphPass::new(&filename, &source);
+        let mut pass = ModelGraphPass::new(filename, source);
         Ok(pass.run(parsed.syntax()))
     }
 

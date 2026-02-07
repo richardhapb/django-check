@@ -1,14 +1,14 @@
 //! N+1 query detection pass.
 
+use ruff_python_ast::ModModule;
 use ruff_python_ast::{Expr, Stmt, visitor::Visitor, visitor::walk_expr, visitor::walk_stmt};
-use ruff_python_ast::{ExprCall, ModModule};
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 // Assume these imports exist in your crate structure
 use crate::diagnostic::NPlusOneDiagnostic;
-use crate::ir::binding::{DjangoSymbol, DjangoSymbolId, QuerySetState};
+use crate::ir::binding::{DjangoSymbol, DjangoSymbolId, PrefetchInfo, QuerySetState};
 use crate::ir::model::ModelGraph;
 use crate::passes::Pass;
 use crate::passes::{extract_attribute_chain, functions::QueryFunction};
@@ -108,6 +108,39 @@ impl<'a> QuerySetResolver<'a> {
             }
         }
 
+        // Check for `Prefetch("lookup", queryset=...)` calls
+        if let Some(name) = call.func.as_name_expr()
+            && name.id == "Prefetch"
+        {
+            // Get the lookup string (first positional arg)
+            let lookup = call
+                .arguments
+                .args
+                .first()
+                .and_then(|a| a.as_string_literal_expr())
+                .map(|s| s.value.to_string())?;
+
+            // Get the queryset state if provided
+            let queryset_state = call
+                .arguments
+                .keywords
+                .iter()
+                .find(|kw| kw.arg.as_ref().is_some_and(|a| a.id == "queryset"))
+                .and_then(|kw| self.resolve(&kw.value))
+                .and_then(|sym| {
+                    if let DjangoSymbol::QuerySet(state) = sym {
+                        Some(state)
+                    } else {
+                        None
+                    }
+                });
+
+            return Some(DjangoSymbol::Prefetch(PrefetchInfo {
+                lookup,
+                queryset_state,
+            }));
+        }
+
         // Check for QuerySet method chaining (e.g. `User.objects.filter(...)`)
         // We look at the function being called (e.g. `User.objects.filter`)
         let Expr::Attribute(attr) = &*call.func else {
@@ -143,6 +176,10 @@ impl<'a> QuerySetResolver<'a> {
                 // This branch handles cases like `Model.objects.get(...).related.all()`
                 None
             }
+            DjangoSymbol::Prefetch(_) => {
+                // Prefetch objects don't have methods that we care about
+                None
+            }
         }
     }
 
@@ -173,6 +210,10 @@ impl<'a> QuerySetResolver<'a> {
                             return None;
                         }
                     }
+                }
+                DjangoSymbol::Prefetch(_) => {
+                    // Prefetch objects don't have attributes we care about
+                    return None;
                 }
             }
         }
@@ -207,23 +248,24 @@ impl<'a> QuerySetResolver<'a> {
             let mut literal_fields =
                 Self::resolve_prefetch_literal_fields(call.arguments.args.as_ref());
 
-            let call_fields: Vec<&ExprCall> = call
-                .arguments
-                .args
-                .iter()
-                .filter_map(|a| a.as_call_expr())
-                .collect();
+            // Collect Prefetch objects with their queryset's prefetched relations
+            // We need to merge these after parse_relation_fields creates the structure
+            let mut prefetch_querysets: Vec<(String, HashMap<String, QuerySetState>)> = Vec::new();
 
-            // Parse all the fields inside the `Prefetch` object if it is present
-            for call_field in call_fields {
-                if call_field
-                    .func
-                    .as_name_expr()
-                    .is_some_and(|n| n.id == "Prefetch")
-                {
-                    literal_fields.extend(Self::resolve_prefetch_literal_fields(
-                        call_field.arguments.args.as_ref(),
-                    ));
+            // Process all arguments to find Prefetch objects (inline or via variables)
+            for arg in call.arguments.args.iter() {
+                // Try to resolve the argument - it might be a Prefetch symbol
+                if let Some(DjangoSymbol::Prefetch(prefetch_info)) = self.resolve(arg) {
+                    // Add the lookup to literal_fields
+                    literal_fields.push(prefetch_info.lookup.clone());
+
+                    // If the Prefetch has a custom queryset with prefetched relations, track it
+                    if let Some(qs_state) = prefetch_info.queryset_state
+                        && !qs_state.prefetched_relations.is_empty()
+                    {
+                        prefetch_querysets
+                            .push((prefetch_info.lookup, qs_state.prefetched_relations));
+                    }
                 }
             }
 
@@ -236,6 +278,18 @@ impl<'a> QuerySetResolver<'a> {
                 );
                 state.prefetched_relations.extend(relations);
             }
+
+            // Merge nested prefetched relations from Prefetch querysets
+            // This attaches them at the correct depth in the structure
+            for (lookup, nested_relations) in prefetch_querysets {
+                // Handle chained lookups like "orders__items"
+                let parts: Vec<&str> = lookup.split("__").collect();
+                Self::extend_prefetch_at_depth(
+                    &mut state.prefetched_relations,
+                    &parts,
+                    nested_relations,
+                );
+            }
         }
     }
 
@@ -244,6 +298,25 @@ impl<'a> QuerySetResolver<'a> {
             .filter_map(|a| a.as_string_literal_expr())
             .map(|s| s.value.to_string())
             .collect()
+    }
+
+    /// Recursively traverse the prefetched_relations structure and extend at the correct depth
+    fn extend_prefetch_at_depth(
+        relations: &mut HashMap<String, QuerySetState>,
+        parts: &[&str],
+        nested: HashMap<String, QuerySetState>,
+    ) {
+        if let Some((first, rest)) = parts.split_first()
+            && let Some(entry) = relations.get_mut(*first)
+        {
+            if rest.is_empty() {
+                // We've reached the target depth, extend here
+                entry.prefetched_relations.extend(nested);
+            } else {
+                // Continue traversing
+                Self::extend_prefetch_at_depth(&mut entry.prefetched_relations, rest, nested);
+            }
+        }
     }
 }
 
@@ -340,7 +413,9 @@ impl<'a> NPlusOnePass<'a> {
             }
 
             // Walk the chain (e.g. user.profile.settings)
+            // We need to track both the current model and the current prefetch state
             let mut current_model = ctx.queryset_state.model_name.clone();
+            let mut current_state = &ctx.queryset_state;
 
             for (i, segment) in chain.iter().enumerate() {
                 // Is this segment a relation?
@@ -352,15 +427,9 @@ impl<'a> NPlusOnePass<'a> {
                 }
 
                 // Is it safe?
-                // The 'safe' check needs to account for the depth of the chain.
-                // e.g. "profile" must be in prefetched.
-                // If we are at "user.profile.settings", "profile" must be checked.
-
-                // Construct the full path up to this point for lookup
-                // e.g. "profile" or "profile__settings"
-                let relation_path = segment;
-
-                if !ctx.queryset_state.is_access_safe(relation_path) {
+                // Check if this segment is in the CURRENT state's prefetched_relations
+                // This properly handles chained access like t.ticker.industry.sector
+                if !current_state.is_access_safe(segment) {
                     self.diagnostics.push(build_diagnostic(
                         self.filename,
                         self.source,
@@ -373,9 +442,17 @@ impl<'a> NPlusOnePass<'a> {
                     break; // Once flagged, stop to avoid noisy duplicates
                 }
 
-                // Advance the model
+                // Advance the model and the state
                 if let Some(next_model) = self.model_graph.get_relation(&current_model, segment) {
                     current_model = next_model.to_string();
+                    // Move to the nested prefetch state for the next segment
+                    if let Some(next_state) = current_state.prefetched_relations.get(*segment) {
+                        current_state = next_state;
+                    } else {
+                        // This shouldn't happen if is_access_safe passed, fails only in debug mode
+                        debug_assert!(false);
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -478,6 +555,7 @@ impl<'a> NPlusOnePass<'a> {
                         loop_var: target_name.id.to_string(),
                         queryset_state: state,
                     }),
+                    DjangoSymbol::Prefetch(_) => None, // Can't iterate over a Prefetch object
                 };
 
                 if let Some(ctx) = context {
@@ -655,6 +733,7 @@ impl<'a> Visitor<'a> for NPlusOnePass<'a> {
                             loop_var: target_name.id.to_string(),
                             queryset_state: state,
                         }),
+                        DjangoSymbol::Prefetch(_) => None, // Can't iterate over a Prefetch object
                     };
 
                     if let Some(ctx) = context {
@@ -1291,5 +1370,144 @@ print([user.orders for user in users])
         "#;
         let diags = run_pass(source);
         assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn prefetch_object_with_nested_queryset() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Item(Model):
+    order = models.ForeignKey(Order, related_name="items")
+
+users = User.objects.prefetch_related(
+    Prefetch("orders", queryset=Order.objects.prefetch_related("items"))
+)
+for user in users:
+    for order in user.orders:
+        print(order.items)  # Should be safe - items is prefetched in the queryset
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn prefetch_object_with_nested_queryset_missing_inner_prefetch() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Item(Model):
+    order = models.ForeignKey(Order, related_name="items")
+
+users = User.objects.prefetch_related(
+    Prefetch("orders", queryset=Order.objects.all())
+)
+for user in users:
+    for order in user.orders:
+        print(order.items)  # Should warn - items is NOT prefetched
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn prefetch_object_variable_with_nested_queryset() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Item(Model):
+    order = models.ForeignKey(Order, related_name="items")
+
+# Prefetch stored in a variable
+orders_prefetch = Prefetch("orders", queryset=Order.objects.prefetch_related("items"))
+users = User.objects.prefetch_related(orders_prefetch)
+for user in users:
+    for order in user.orders:
+        print(order.items)  # Should be safe - items is prefetched via variable
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn prefetch_object_variable_with_select_related() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Item(Model):
+    order = models.ForeignKey(Order, related_name="items")
+
+# Prefetch with select_related in queryset
+orders_prefetch = Prefetch("orders", queryset=Order.objects.select_related("items"))
+users = User.objects.prefetch_related(orders_prefetch)
+for user in users:
+    for order in user.orders:
+        print(order.items)  # Should be safe - items is select_related via variable
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn chained_select_related_access() {
+        let source = r#"
+class Sector(Model):
+    name = models.CharField(max_length=100)
+
+class Industry(Model):
+    sector = models.ForeignKey(Sector, related_name="industries")
+
+class Ticker(Model):
+    industry = models.ForeignKey(Industry, related_name="tickers")
+
+class Tier1(Model):
+    ticker = models.ForeignKey(Ticker, related_name="tier1s")
+
+tier1s = Tier1.objects.select_related("ticker__industry__sector").all()
+for t in tier1s:
+    print(t.ticker.industry.sector.name)  # Should be safe - fully select_related
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn chained_select_related_partial_access() {
+        let source = r#"
+class Sector(Model):
+    name = models.CharField(max_length=100)
+
+class Industry(Model):
+    sector = models.ForeignKey(Sector, related_name="industries")
+
+class Ticker(Model):
+    industry = models.ForeignKey(Industry, related_name="tickers")
+
+class Tier1(Model):
+    ticker = models.ForeignKey(Ticker, related_name="tier1s")
+
+# Only select_related up to industry, not sector
+tier1s = Tier1.objects.select_related("ticker__industry").all()
+for t in tier1s:
+    print(t.ticker.industry.sector)  # Should warn - sector is NOT select_related
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
     }
 }

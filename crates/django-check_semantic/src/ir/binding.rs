@@ -34,12 +34,23 @@ impl QuerySetState {
     }
 }
 
+/// Information about a Prefetch object (e.g., `Prefetch("orders", queryset=...)`)
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PrefetchInfo {
+    /// The lookup string (e.g., "orders" or "orders__items")
+    pub lookup: String,
+    /// The queryset's state if a custom queryset was provided
+    pub queryset_state: Option<QuerySetState>,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum DjangoSymbol {
     /// A `QuerySet` instance (e.g., `User.objects.all()`)
     QuerySet(QuerySetState),
     /// A Model instance (e.g., `user` inside a loop)
     ModelInstance(QuerySetState),
+    /// A Prefetch object (e.g., `Prefetch("orders", queryset=...)`)
+    Prefetch(PrefetchInfo),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
