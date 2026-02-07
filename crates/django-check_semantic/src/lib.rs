@@ -1,5 +1,3 @@
-#![feature(slice_pattern)]
-#![allow(unstable_name_collisions)]
 #![allow(dead_code)] // Under development
 mod diagnostic;
 mod error;

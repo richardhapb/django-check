@@ -5,7 +5,6 @@
 //! - ForeignKey, OneToOneField, ManyToManyField declarations
 //! - related_name and other field options
 
-use core::slice::SlicePattern;
 use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::StmtClassDef;
@@ -139,9 +138,7 @@ impl<'a> ModelGraphPass<'a> {
     }
 
     fn find_parent_name(&self, class_def: &'a StmtClassDef) -> Option<&'a str> {
-        let args = class_def.arguments.as_ref()?.args.as_slice();
-
-        for arg in args {
+        for arg in class_def.arguments.as_ref()?.args.as_ref() {
             if let Some(name_expr) = arg.as_name_expr() {
                 let name = name_expr.id.as_str();
                 if self.graph.models().any(|m| m.name == name) {
