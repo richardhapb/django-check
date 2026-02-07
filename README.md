@@ -178,17 +178,13 @@ for user in users:
 
 * Interprocedural analysis requires type hints on QuerySet parameters
 * Limited understanding of:
-  * `Prefetch` objects
+  * `Prefetch` objects with basic access support (e.g. `Prefetch("related_model")`)
   * `annotate`, `aggregate`
   * complex custom managers
-* No complete capture of implicit prefetchs in django chains when has many. e.g.
-  `prefetch_releated(chat.users__profile)`, then iterate over `chat.users` and
-  access to `profile`. This will raise a warning.
 
 ## Roadmap
 
-* Prefetch object support
-* Capture of implicits prefetchs in a root instance
+* Complete Prefetch object support
 * Custom queryset method summaries
 * Templates integration
 

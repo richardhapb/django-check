@@ -90,27 +90,31 @@ impl Parser {
 
         for entry in Self::python_files(dir) {
             let filename = Self::relative_path(dir, entry.path());
-            let source = match fs::read_to_string(entry.path()) {
+            let source = fs::read_to_string(entry.path())?;
+            let graph = match self.build_graph(&source, &filename) {
                 Ok(source) => source,
                 Err(err) => {
                     warn!(%err, source=%filename, "parsing graph");
                     continue;
                 }
             };
-            let parsed = match self.parse_module(&source) {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    warn!(%err, source=%filename, "parsing graph");
-                    continue;
-                }
-            };
-
-            let mut pass = ModelGraphPass::new(&filename, &source);
-            let graph = pass.run(parsed.syntax());
             combined_graph.merge(graph);
         }
 
         Ok(combined_graph)
+    }
+
+    pub fn build_graph(
+        &self,
+        source: &str,
+        filename: &str,
+    ) -> Result<ModelGraph, SourceParseError> {
+        let parsed = self
+            .parse_module(source)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "parsing module"))?;
+
+        let mut pass = ModelGraphPass::new(&filename, &source);
+        Ok(pass.run(parsed.syntax()))
     }
 
     pub fn extract_functions(&self, dir: &Path) -> Result<Vec<QueryFunction>, SourceParseError> {

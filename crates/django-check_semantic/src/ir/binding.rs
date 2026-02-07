@@ -1,6 +1,8 @@
 //! Binding-level intermediate representation for tracking variable states.
 
-use std::collections::HashSet;
+use std::{collections::HashMap, str::Split};
+
+use crate::{ModelGraph, ir::model::ModelDef};
 
 #[derive(Debug, Clone, Copy, Eq, Hash, PartialEq)]
 pub struct DjangoSymbolId(pub u32);
@@ -14,7 +16,7 @@ impl DjangoSymbolId {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct QuerySetState {
     pub model_name: String,
-    pub prefetched_relations: HashSet<String>,
+    pub prefetched_relations: HashMap<String, QuerySetState>,
     pub is_values_query: bool,
 }
 
@@ -22,13 +24,13 @@ impl QuerySetState {
     pub fn new(model_name: String) -> Self {
         Self {
             model_name,
-            prefetched_relations: HashSet::new(),
+            prefetched_relations: HashMap::new(),
             is_values_query: false,
         }
     }
 
     pub fn is_access_safe(&self, relation: &str) -> bool {
-        self.is_values_query || self.prefetched_relations.contains(relation)
+        self.is_values_query || self.prefetched_relations.contains_key(relation)
     }
 }
 
@@ -50,46 +52,78 @@ pub enum DjangoSymbolKind {
     Unknown,
 }
 
-/// Parse Django relation field syntax (e.g., "author__profile" -> ["author", "profile"])
-pub fn parse_relation_fields(fields: &[String]) -> Vec<String> {
-    fields
-        .iter()
-        .flat_map(|field| field.split("__"))
-        .map(|s| s.to_string())
-        .collect()
+/// Parse Django relation field syntax (e.g., "author__profile" ->
+/// [PrefetchedRelation(QuerySetState)] with `profile` prefetched)
+pub fn parse_relation_fields(
+    model: &ModelDef,
+    model_graph: &ModelGraph,
+    fields: &[String],
+) -> HashMap<String, QuerySetState> {
+    let mut relations = HashMap::new();
+    for field in fields.iter() {
+        let parts = field.split("__");
+        if let Some((literal, relation)) = bind_relation(model, model_graph, parts) {
+            relations.insert(literal, relation);
+        }
+    }
+
+    relations
+}
+
+fn bind_relation(
+    model: &ModelDef,
+    model_graph: &ModelGraph,
+    mut parts: Split<'_, &str>,
+) -> Option<(String, QuerySetState)> {
+    if let Some(base) = parts.next()
+        && let Some(relation) = model_graph.get_relation(&model.name, base)
+        && let Some(related_model) = model_graph.get(relation)
+    {
+        let mut qs = QuerySetState::new(related_model.name.to_string());
+
+        // Insert child relation
+        if let Some((literal, relation)) = bind_relation(related_model, model_graph, parts) {
+            qs.prefetched_relations.insert(literal, relation);
+        };
+        return Some((base.to_string(), qs));
+    }
+
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::Parser;
+
     use super::*;
 
-    #[test]
-    fn parse_single_field() {
-        let fields = vec!["ticker".to_string()];
-        assert_eq!(parse_relation_fields(&fields), vec!["ticker"]);
-    }
+    fn get_graph() -> ModelGraph {
+        let source = r#"
+class User(Model):
+    pass
 
-    #[test]
-    fn parse_nested_field() {
-        let fields = vec!["theoanalysis__ticker".to_string()];
-        assert_eq!(
-            parse_relation_fields(&fields),
-            vec!["theoanalysis", "ticker"]
-        );
-    }
+class Photo(Model):
+    user = models.ForeignKey(User, related_name="photos")
 
-    #[test]
-    fn parse_deeply_nested() {
-        let fields = vec!["a__b__c__d".to_string()];
-        assert_eq!(parse_relation_fields(&fields), vec!["a", "b", "c", "d"]);
-    }
 
-    #[test]
-    fn parse_multiple_fields() {
-        let fields = vec!["ticker__sector".to_string(), "analysis__report".to_string()];
-        assert_eq!(
-            parse_relation_fields(&fields),
-            vec!["ticker", "sector", "analysis", "report"]
-        );
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Order(Model):
+    user = models.ForeignKey(User, related_name="orders")
+
+class Sale(Model):
+    order = models.ForeignKey(Sale, related_name="sales")
+
+class Transaction(Model):
+    sale = models.ForeignKey(Sale, related_name="transactions")
+
+
+users = User.objects.all().prefetch_related(Prefetch("orders"))
+print([user.orders for user in users])
+        "#;
+
+        let parser = Parser::new();
+        parser.build_graph(source, "test.py").unwrap()
     }
 }

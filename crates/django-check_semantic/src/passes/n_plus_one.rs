@@ -154,21 +154,25 @@ impl<'a> QuerySetResolver<'a> {
                     // Accessing `user.orders` -> Returns a QuerySet for the related model
                     // Accessing an attribute on a queryset (e.g., `orders.users`)
                     // If it's a relation on the model, return a QuerySet of the related model
-                    if let Some(related_model) = self
-                        .model_graph
-                        .get_relation(&state.model_name, &attr.attr.id)
-                    {
-                        let mut new_state = QuerySetState::new(related_model.to_string());
-                        // FIXME: Currently we use the current relations to be inherited by the related
-                        // model, probably a better idea is to detect dynamically the appropiates
-                        // prefetched relations but for now this is ok.
-                        new_state
-                            .prefetched_relations
-                            .extend(state.prefetched_relations);
-                        return Some(DjangoSymbol::QuerySet(new_state));
+                    // firs try to get the prefetched query set state, if it is not prefetched, create
+                    // an empty query set state
+                    match state.prefetched_relations.get(&attr.attr.id.to_string()) {
+                        Some(related_state) => {
+                            return Some(DjangoSymbol::QuerySet(related_state.clone()));
+                        }
+                        None => {
+                            if let Some(related_model) = self
+                                .model_graph
+                                .get_relation(&state.model_name, &attr.attr.id)
+                            {
+                                // Empty state, no prefetch related detected before for this model
+                                let new_state = QuerySetState::new(related_model.to_string());
+                                return Some(DjangoSymbol::QuerySet(new_state));
+                            }
+                            // Could be accessing a regular field, return None
+                            return None;
+                        }
                     }
-                    // Could be accessing a regular field, return None
-                    return None;
                 }
             }
         }
@@ -223,9 +227,15 @@ impl<'a> QuerySetResolver<'a> {
                 }
             }
 
-            // Helper from binding.rs
-            let relations = crate::ir::binding::parse_relation_fields(&literal_fields);
-            state.prefetched_relations.extend(relations);
+            // Resolve prefetched relations
+            if let Some(model) = self.model_graph.get(&state.model_name) {
+                let relations = crate::ir::binding::parse_relation_fields(
+                    model,
+                    self.model_graph,
+                    &literal_fields,
+                );
+                state.prefetched_relations.extend(relations);
+            }
         }
     }
 
@@ -838,8 +848,11 @@ for item in qs:
     #[test]
     fn safe_with_prefetch() {
         let source = r#"
+class App(Model):
+    pass
+
 class User(Model):
-    related_field = models.ForeignKey("some.App")
+    related_field = models.ForeignKey("App")
 
 qs = User.objects.filter(active=True).prefetch_related('related_field')
 for item in qs:
@@ -984,6 +997,29 @@ for p in performances:
 "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn allow_using_deep_chained_prefetch() {
+        let source = r#"
+class Analysis(Model):
+    pattern = models.ForeignKey("Pattern", related_name="analyses")
+
+class Performance(Model):
+    analysis = models.ForeignKey("Analysis", related_name="performances")
+
+class Pattern(Model):
+    name = models.CharField(max_length=20)
+
+
+patterns = Pattern.objects.prefetch_related("analyses__performances").all()
+
+for p in patterns:
+    for a in p.analyses:
+       print(a.performances)  # safe
+"#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
     }
 
     #[test]
