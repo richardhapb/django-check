@@ -1,10 +1,13 @@
 [package]
 name = "django-check"
-version = "0.1.1"
+version = "0.1.2"
 rust-version = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }
 edition = { workspace = true }
+readme = "README.md"
+repository = "https://github.com/richardhapb/django-check"
+description = "Static N+1 query detector for Django ORM"
 
 [[bin]]
 name = "djch"

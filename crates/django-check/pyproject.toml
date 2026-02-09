@@ -1,0 +1,45 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "djch"
+version = "0.1.2"
+description = "Static N+1 query detector for Django ORM – fast Rust-powered checker"
+# For PyPI long description (shows formatted on project page)
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Richard", email = "richard.penab@gmail.com"},
+]
+keywords = ["django", "n+1", "orm", "query-optimization", "static-analysis", "lsp", "cli", "rust"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Framework :: Django",
+    "Framework :: Django :: 4.0",
+    "Framework :: Django :: 5.0",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/richardhapb/django-check"
+Documentation = "https://github.com/richardhapb/django-check#readme"
+Repository = "https://github.com/richardhapb/django-check.git"
+Issues = "https://github.com/richardhapb/django-check/issues"
+Changelog = "https://github.com/richardhapb/django-check/releases"
+
+[tool.maturin]
+bindings = "bin"

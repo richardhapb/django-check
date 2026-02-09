@@ -48,7 +48,17 @@ Runtime tools (django-silk, nplusone) are focuesd in runtime optimiezation. `dja
 
 ## Installation
 
-Not available yet, should be compiled from source.
+```bash
+pip install djch
+```
+
+Or with uv:
+
+```bash
+uv pip install djch
+```
+
+This installs the `djch` binary to your PATH.
 
 
 ## CLI
