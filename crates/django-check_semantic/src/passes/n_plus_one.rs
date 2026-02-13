@@ -83,6 +83,8 @@ impl<'a> QuerySetResolver<'a> {
             Expr::Call(call) => self.resolve_call(call),
             Expr::Attribute(attr) => self.resolve_attribute(attr),
             Expr::Name(name) => self.symbols.lookup(&name.id).cloned(),
+            // Handle slice like myqueryset[0:100]
+            Expr::Subscript(subscript) => self.resolve(&subscript.value),
             _ => None,
         }
     }
@@ -1506,6 +1508,43 @@ class Tier1(Model):
 tier1s = Tier1.objects.select_related("ticker__industry").all()
 for t in tier1s:
     print(t.ticker.industry.sector)  # Should warn - sector is NOT select_related
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_query_using_subscript() {
+        let source = r#"
+class User(Model):
+     name = models.CharField()
+
+class Payment(Model):
+    user = models.ForeignKey(User, related_name="payments")
+    amount = models.FloatField()
+
+payments = Payment.objects.all().order_by("-amount")
+top_payments = payments[0:10]
+for payment in top_payments:
+    print(payment.user.name)
+        "#;
+        let diags = run_pass(source);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn detect_query_using_subscript_in_for_stmt() {
+        let source = r#"
+class User(Model):
+     name = models.CharField()
+
+class Payment(Model):
+    user = models.ForeignKey(User, related_name="payments")
+    amount = models.FloatField()
+
+payments = Payment.objects.all().order_by("-amount")
+for payment in payments[0:10]:
+    print(payment.user.name)
         "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);

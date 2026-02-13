@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "djch"
-version = "0.1.2"
+version = "0.1.3"
 description = "Static N+1 query detector for Django ORM – fast Rust-powered checker"
 # For PyPI long description (shows formatted on project page)
 readme = {file = "README.md", content-type = "text/markdown"}
