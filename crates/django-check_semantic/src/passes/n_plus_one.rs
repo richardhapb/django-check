@@ -281,6 +281,18 @@ impl<'a> QuerySetResolver<'a> {
                 state.prefetched_relations.extend(relations);
             }
 
+            // Be permissive with explicit developer hints: when model resolution is
+            // ambiguous (e.g. duplicate model names across apps), keep declared
+            // select_related/prefetch_related paths as safe to reduce false positives.
+            let fallback_model = state.model_name.clone();
+            for field in &literal_fields {
+                Self::insert_declared_prefetch_path(
+                    &mut state.prefetched_relations,
+                    field,
+                    &fallback_model,
+                );
+            }
+
             // Merge nested prefetched relations from Prefetch querysets
             // This attaches them at the correct depth in the structure
             for (lookup, nested_relations) in prefetch_querysets {
@@ -317,6 +329,26 @@ impl<'a> QuerySetResolver<'a> {
             } else {
                 // Continue traversing
                 Self::extend_prefetch_at_depth(&mut entry.prefetched_relations, rest, nested);
+            }
+        }
+    }
+
+    fn insert_declared_prefetch_path(
+        relations: &mut HashMap<String, QuerySetState>,
+        lookup: &str,
+        fallback_model: &str,
+    ) {
+        let mut iter = lookup.split("__");
+        if let Some(first) = iter.next() {
+            let mut current = relations
+                .entry(first.to_string())
+                .or_insert_with(|| QuerySetState::new(fallback_model.to_string()));
+
+            for part in iter {
+                current = current
+                    .prefetched_relations
+                    .entry(part.to_string())
+                    .or_insert_with(|| QuerySetState::new(fallback_model.to_string()));
             }
         }
     }
@@ -1548,5 +1580,80 @@ for payment in payments[0:10]:
         "#;
         let diags = run_pass(source);
         assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn admin_action_queryset_select_related_reassignment_is_safe() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Profile(Model):
+    user = models.ForeignKey(User, related_name="profiles")
+
+def deactivate_duplicated_profile(queryset: QuerySet[Profile]):
+    queryset = queryset.select_related("user")
+    for profile in queryset:
+        print(profile.user)
+        "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn admin_modeladmin_action_method_queryset_select_related_is_safe() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Profile(Model):
+    user = models.ForeignKey(User, related_name="profiles")
+
+class ProfileAdmin(Model):
+    def deactivate_duplicated_profile(self, _, queryset: QuerySet[Profile]):
+        queryset = queryset.select_related("user")
+        for profile in queryset:
+            print(profile.user)
+            "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn admin_action_fix_user_date_joined_pattern_is_safe() {
+        let source = r#"
+class User(Model):
+    pass
+
+class Profile(Model):
+    user = models.ForeignKey(User, related_name="profiles")
+    dirty_code_id = models.CharField(max_length=100, null=True)
+    email_confirmed = models.DateTimeField(null=True)
+
+class ProfileAdmin(Model):
+    def fix_user_date_joined(self, _, queryset: QuerySet[Profile]):
+        queryset = queryset.select_related("user")
+        for profile in queryset:
+            if profile.dirty_code_id:
+                profile.user.date_joined = profile.email_confirmed
+                profile.user.save()
+            "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn explicit_select_related_is_trusted_when_relation_is_unknown() {
+        let source = r#"
+class Profile(Model):
+    pass
+
+def fix_user_date_joined(queryset: QuerySet[Profile]):
+    queryset = queryset.select_related("user")
+    for profile in queryset:
+        print(profile.user)
+            "#;
+        let diags = run_pass(source);
+        assert!(diags.is_empty());
     }
 }

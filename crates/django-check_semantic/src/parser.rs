@@ -36,16 +36,12 @@ impl Parser {
     fn analyze_n_plus_one_file(
         &self,
         file: &Path,
+        display_file: &str,
         model_graph: &ModelGraph,
         functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, SourceParseError> {
         let source = fs::read_to_string(file)?;
-        self.analyze_source(
-            &source,
-            file.to_str().expect("conver to str"),
-            model_graph,
-            functions,
-        )
+        self.analyze_source(&source, display_file, model_graph, functions)
     }
 
     /// Run N+1 detection on a file or a directory, this function figure out
@@ -61,11 +57,10 @@ impl Parser {
 
         if path.is_dir() {
             for entry in Self::python_files(path) {
+                let display_path = Self::relative_path(path, entry.path());
                 let diagnostics = match self.analyze_n_plus_one_file(
-                    entry
-                        .path()
-                        .strip_prefix(path)
-                        .expect("path derived from prefix"),
+                    entry.path(),
+                    &display_path,
                     model_graph,
                     functions,
                 ) {
@@ -78,7 +73,9 @@ impl Parser {
                 all_diagnostics.extend(diagnostics);
             }
         } else if path.is_file() {
-            all_diagnostics = self.analyze_n_plus_one_file(path, model_graph, functions)?;
+            let display_path = path.to_string_lossy().to_string();
+            all_diagnostics =
+                self.analyze_n_plus_one_file(path, &display_path, model_graph, functions)?;
         }
 
         Ok(all_diagnostics)
@@ -167,7 +164,8 @@ impl Parser {
         model_graph: &ModelGraph,
         functions: &[QueryFunction],
     ) -> Result<Vec<NPlusOneDiagnostic>, SourceParseError> {
-        self.analyze_n_plus_one_file(file, model_graph, functions)
+        let display_path = file.to_string_lossy().to_string();
+        self.analyze_n_plus_one_file(file, &display_path, model_graph, functions)
     }
 
     /// Run all analyses in a source code and return diagnostics

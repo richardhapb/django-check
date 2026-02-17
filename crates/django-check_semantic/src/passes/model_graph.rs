@@ -72,8 +72,9 @@ impl<'a> ModelGraphPass<'a> {
                 // Direct Model import or custom base class
                 Expr::Name(name) => {
                     let n = name.id.as_str();
-                    // Common patterns: Model, BaseModel, AbstractModel, etc.
-                    if n == "Model" || n.ends_with("Model") || n.ends_with("Base") {
+                    // Common Django patterns: Model, BaseModel, AbstractModel, etc.
+                    // Avoid generic `Base` classes (e.g. SQLAlchemy declarative base).
+                    if n == "Model" || n.ends_with("Model") {
                         return true;
                     }
                 }
@@ -226,16 +227,30 @@ fn extract_related_name(call: &ruff_python_ast::ExprCall) -> Option<String> {
 
 /// Analyze an Stmt and capture the relation if it exists
 fn extract_relation_from_stmt(stmt: &Stmt, model_name: &str) -> Option<Relation> {
-    let Stmt::Assign(assign) = stmt else {
-        return None;
-    };
+    match stmt {
+        Stmt::Assign(assign) => {
+            let Some(Expr::Name(target)) = assign.targets.first() else {
+                return None;
+            };
+            extract_relation_from_value(&target.id, assign.value.as_ref(), model_name)
+        }
+        Stmt::AnnAssign(assign) => {
+            let Expr::Name(target) = assign.target.as_ref() else {
+                return None;
+            };
+            let value = assign.value.as_ref()?;
+            extract_relation_from_value(&target.id, value, model_name)
+        }
+        _ => None,
+    }
+}
 
-    let Some(Expr::Name(target)) = assign.targets.first() else {
-        return None;
-    };
-    let field_name = target.id.to_string();
-
-    let Expr::Call(call) = assign.value.as_ref() else {
+fn extract_relation_from_value(
+    field_name: &str,
+    value: &Expr,
+    model_name: &str,
+) -> Option<Relation> {
+    let Expr::Call(call) = value else {
         return None;
     };
 
@@ -245,7 +260,7 @@ fn extract_relation_from_stmt(stmt: &Stmt, model_name: &str) -> Option<Relation>
 
     Some(Relation::new(
         model_name,
-        field_name,
+        field_name.to_string(),
         target_model,
         relation_type,
         related_name,
@@ -383,6 +398,21 @@ class Article(models.Model):
     }
 
     #[test]
+    fn extract_annotated_relation_fields() {
+        let source = r#"
+class Profile(models.Model):
+    user: User = models.ForeignKey(User, on_delete=models.CASCADE)
+    "#;
+        let graph = run_pass(source);
+        let profile = graph.get("Profile").expect("Profile should exist");
+
+        assert_eq!(profile.relations.len(), 1);
+        assert_eq!(profile.relations[0].field_name, "user");
+        assert_eq!(profile.relations[0].target_model, "User");
+        assert_eq!(profile.relations[0].relation_type, RelationType::ForeignKey);
+    }
+
+    #[test]
     fn dependents_query() {
         let source = r#"
 class User(models.Model):
@@ -512,5 +542,19 @@ class CreatedOrder(Order):
                 .any(|r| r.target_model == "User"
                     && r.related_name("CreatedOrder") == "createdorders")
         );
+    }
+
+    #[test]
+    fn doesnt_extract_sqlalchemy_base_models() {
+        let source = r#"
+from sqlalchemy.ext.declarative import declarative_base
+
+Base = declarative_base()
+
+class User(Base):
+    pass
+"#;
+        let graph = run_pass(source);
+        assert_eq!(graph.model_count(), 0);
     }
 }
