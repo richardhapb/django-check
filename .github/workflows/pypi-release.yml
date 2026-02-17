@@ -21,6 +21,7 @@ permissions:
   contents: write
   # Used to generate artifact attestation
   attestations: write
+  actions: write
 
 jobs:
   linux:
