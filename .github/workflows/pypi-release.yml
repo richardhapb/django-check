@@ -3,15 +3,11 @@
 #
 #    maturin generate-ci github --manifest-path crates/django-check/Cargo.toml
 #
-name: CI
+name: PyPI-Release
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - '*'
-  pull_request:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:

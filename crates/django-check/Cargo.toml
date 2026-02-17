@@ -1,6 +1,6 @@
 [package]
 name = "django-check"
-version = "0.1.5"
+version = "0.1.6"
 rust-version = { workspace = true }
 license = { workspace = true }
 authors = { workspace = true }

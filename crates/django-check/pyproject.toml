@@ -4,12 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "djch"
-version = "0.1.5"
+version = "0.1.6"
 description = "Static N+1 query detector for Django ORM – fast Rust-powered checker"
 # For PyPI long description (shows formatted on project page)
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.8"
 license = {text = "MIT"}
+license-files = ["LICENSE"]
 authors = [
     {name = "Richard", email = "richard.penab@gmail.com"},
 ]
@@ -43,3 +44,7 @@ Changelog = "https://github.com/richardhapb/django-check/releases"
 
 [tool.maturin]
 bindings = "bin"
+include = [
+    { path = "LICENSE", format = "sdist" },
+    { path = "LICENSE", format = "wheel" },
+]
