@@ -87,7 +87,13 @@ impl Parser {
 
         for entry in Self::python_files(dir) {
             let filename = Self::relative_path(dir, entry.path());
-            let source = fs::read_to_string(entry.path())?;
+            let source = match fs::read_to_string(entry.path()) {
+                Ok(source) => source,
+                Err(err) => {
+                    warn!(%err, source=%filename, "parsing file");
+                    continue;
+                }
+            };
             let graph = match self.build_graph(&source, &filename) {
                 Ok(source) => source,
                 Err(err) => {
